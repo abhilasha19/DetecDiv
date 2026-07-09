@@ -208,10 +208,10 @@ function contract = defaultContractForNode(node)
                 selectors.framesParam = 'frames';
                 selectors.outputNameParam = 'outputName';
                 parameters.run = {};
-                parameters.static = [{'maskChannelCount','scoreChannelCount'}, maskStaticKeys, {'BrightestPixels'}];
+                parameters.static = [{'maskChannelCount','scoreChannelCount'}, maskStaticKeys, {'BrightestPixels','computeMaskCombinations'}];
                 requirements.roi.required = true;
                 requirements.roi.dataSeries = false;
-                requirements.params.optional = [{'pkg','maskChannelCount','scoreChannelCount'}, maskNameKeys, scoreNameKeys, maskStaticKeys, {'BrightestPixels'}];
+                requirements.params.optional = [{'pkg','maskChannelCount','scoreChannelCount'}, maskNameKeys, scoreNameKeys, maskStaticKeys, {'BrightestPixels','computeMaskCombinations'}];
                 capabilities.preservesRoiList = true;
                 capabilities.roiDataSeries = true;
                 capabilities.outputsDataSeries = true;
@@ -223,7 +223,7 @@ function contract = defaultContractForNode(node)
                 binding.selectorKeys = [maskNameKeys, scoreNameKeys];
                 binding.resolveAt = 'run';
                 resources.in = computeMetricsInputResources(maskSlotCount, scoreSlotCount);
-                resources.out = resourceDef('dataSeries', 'metrics', 'channel_quantification', '', 'dataSeries', '', false, 'roiDataSeries');
+                resources.out = resourceDef('dataSeries', 'metrics', 'channel_quantification', 'outputName', 'dataSeries', 'outputName', false, 'roiDataSeries');
                 summary = 'Computes mask-linked fluorescence metrics from selected ROI image or mask channels.';
             elseif strcmp(p, 'singlecelloscillations') || contains(f, 'singlecelloscillations')
                 in = [ ...
@@ -237,28 +237,27 @@ function contract = defaultContractForNode(node)
                 selectors.framesParam = 'frames';
                 parameters.run = {};
                 parameters.static = { ...
-                    'classification_data','fluorescence_data','labelColumn','fluorescenceColumn', ...
-                    'cellValueReducer','frameStart','frameEnd','framePeriod','timeUnit', ...
-                    'baselineMethod','baselineWindow','baselineEndpoints','cycleBoundaryMode', ...
-                    'transitionFrom','transitionTo','minCycleLength','maxCycleLength','normFrames', ...
-                    'interpolationMethod','allowExtrapolation','traceOutputName', ...
-                    'normalizedCyclesOutputName','cycleMetadataOutputName','writeArtifacts', ...
-                    'outputDir','workbookName','runId','verbose'};
+                    'labelVariable','fluorescenceVariable', ...
+                    'cellIndex', ...
+                    'baselineMethod','baselineWindow','baselineEndpoints', ...
+                    'minCycleLength','normFrames', ...
+                    'allowExtrapolation','writeArtifacts', ...
+                    };
                 requirements.roi.required = true;
                 requirements.roi.channelsMin = 0;
                 requirements.roi.dataSeries = true;
-                requirements.params.optional = [{'pkg'}, parameters.static];
+                requirements.params.optional = [{'pkg','classification_data','fluorescence_data'}, parameters.static];
                 capabilities.preservesRoiList = true;
                 capabilities.roiDataSeries = true;
                 capabilities.outputsDataSeries = true;
                 binding.scope = 'roi';
                 binding.outputScope = 'roi';
                 binding.mode = 'dataSeries';
-                binding.selectorKeys = {'classification_data','fluorescence_data'};
+                binding.selectorKeys = {'labelVariable','fluorescenceVariable'};
                 binding.resolveAt = 'run';
                 resources.in = [ ...
-                    resourceDef('dataSeries', 'classification', 'classification_data', 'classification_data', 'dataSeries', 'classification_data', true, ''), ...
-                    resourceDef('dataSeries', 'metrics', 'fluorescence_data', 'fluorescence_data', 'dataSeries', 'fluorescence_data', true, '') ...
+                    resourceDef('dataSeriesVariable', 'classification_label', 'labelVariable', 'labelVariable', 'dataSeriesVariable', 'labelVariable', true, ''), ...
+                    resourceDef('dataSeriesVariable', 'metric_variable', 'fluorescenceVariable', 'fluorescenceVariable', 'dataSeriesVariable', 'fluorescenceVariable', true, '') ...
                     ];
                 resources.out = [ ...
                     resourceDef('dataSeries', 'oscillation_trace', 'osc_detrended_trace', 'traceOutputName', 'dataSeries', 'traceOutputName', false, 'roiDataSeries'), ...
@@ -297,7 +296,7 @@ function contract = defaultContractForNode(node)
             selectors.channelParam = 'channel';
             selectors.framesParam = 'frames';
             selectors.outputNameParam = 'outputName';
-            parameters.template = {'pkg','moduleVar','modulePath','moduleId','description','category','classes','classifyFun','trainingFun','trainingParam','outputType'};
+            parameters.template = {'pkg','moduleVar','modulePath','moduleId','description','category','classes','classifyFun','trainingFun','trainingParam','outputType','intent','operation'};
             parameters.paths = {'modulePath'};
             parameters.run = {};
             requirements.roi.required = true;
@@ -361,7 +360,7 @@ end
 
 function tf = classifierProducesMasks(pkgName, funcName)
     tf = false;
-    if any(strcmp(pkgName, {'cellposesam'}))
+    if any(strcmp(pkgName, {'cellposesam','sam31'}))
         tf = true;
         return;
     end
@@ -742,6 +741,22 @@ function contract = enrichContractFromPackage(contract, node)
                 end
                 contract.resources.out = outs;
                 contract.summary = 'CellposeSAM-like classifier: outputs segmentation masks, probability channels, or both.';
+            case 'sam31'
+                contract.parameters.static = unique([contract.parameters.static sam31ExecutionStaticKeys()], 'stable');
+                contract.requirements.roi.channelsMin = max(contract.requirements.roi.channelsMin, 1);
+                contract.capabilities.outputsMasks = true;
+                contract.capabilities.outputsChannels = false;
+                contract.capabilities.roiMasks = true;
+                contract.capabilities.roiChannels = false;
+                contract.capabilities.roiDataSeries = false;
+                contract.capabilities.outputsDataSeries = false;
+                contract.binding.mode = 'singleChannel';
+                contract.binding.exactCount = 1;
+                contract.binding.resolveAt = 'design';
+                contract.out = portDef('roiList', 'roiList', true, 'edge');
+                contract.out(end+1) = portDef('masks', 'maskSet', true, 'edge');
+                contract.resources.out = resourceDef('mask', 'segmentation', 'segmentation', 'outputName', 'masks', 'outputName', false, 'roiMasks');
+                contract.summary = 'SAM3.1 classifier: outputs instance-tracking masks from ROI movies.';
             case 'deeplab_pixel_classification'
                 outputType = normalizeOutputMode(getNestedParam(node, {'outputType','outputMode'}, 'segmentation'), ...
                     {'segmentation','proba','probability','both'}, 'segmentation');
@@ -815,7 +830,9 @@ function contract = enrichContractFromPackage(contract, node)
                 maxChannelSlots = 5;
                 channelSlotCount = combineMultipleChannelsSlotCount(node, maxChannelSlots);
                 channelSlotKeys = combineMultipleChannelsSlotKeys('Channel', channelSlotCount);
+                mode = combineMultipleChannelsMode(node);
                 rgbSlotKeys = combineMultipleChannelsSlotKeys('RGB_Channel', channelSlotCount);
+                offsetSlotKeys = combineMultipleChannelsSlotKeys('Offset_Channel', min(2, channelSlotCount));
                 contract.out = [ ...
                     portDef('roiList', 'roiList', true, 'edge'), ...
                     portDef('channels', 'channelSet', false, 'edge')];
@@ -832,10 +849,17 @@ function contract = enrichContractFromPackage(contract, node)
                 contract.binding.outputChannelNameParam = 'outputChannelName';
                 contract.binding.transfer = 'roiChannelsToRoiChannel';
                 contract.parameters.run = {};
-                contract.parameters.static = [{'requiredChannelCount'}, rgbSlotKeys, {'debug'}];
+                contract.parameters.static = [{'mode'}, {'requiredChannelCount'}];
+                switch mode
+                    case 'additive'
+                        contract.parameters.static = [contract.parameters.static, rgbSlotKeys];
+                    case 'division'
+                        contract.parameters.static = [contract.parameters.static, offsetSlotKeys];
+                end
+                contract.parameters.static = [contract.parameters.static, {'debug'}];
                 contract.resources.in = combineMultipleChannelsInputResources(channelSlotCount);
                 contract.resources.out = resourceDef('channel', 'derived_roi_image', 'channels', 'outputChannelName', 'channels', 'outputChannelName', false, 'roiChannel');
-                contract.summary = 'Combines selected ROI channels into one derived ROI image channel.';
+                contract.summary = 'Combines selected ROI channels into one derived ROI image channel, either as additive RGB or as arithmetic grayscale.';
             case 'computerls'
                 averageFluoByDivision = computeRLSAverageFluoByDivisionEnabled(node);
                 contract.in = [ ...
@@ -923,6 +947,35 @@ function contract = enrichContractFromPackage(contract, node)
                 contract.resources.in = resourceDef('channel', 'roi_image', 'channel', 'channel', 'channels', 'channel', true, '');
                 contract.resources.out = resourceDef('channel', 'derived_roi_image', 'channels', 'outputChannelName', 'channels', 'outputChannelName', false, 'roiChannel');
                 contract.summary = 'Projects z-stacks from one ROI image channel into a derived ROI channel.';
+            case 'bestfocusplane'
+                contract.out = [ ...
+                    portDef('roiList', 'roiList', true, 'edge'), ...
+                    portDef('channels', 'channelSet', false, 'edge'), ...
+                    portDef('dataSeries', 'dataSeriesSet', false, 'edge') ...
+                    ];
+                contract.selectors.channelsParam = 'channels';
+                contract.selectors.channelParam = 'channel';
+                contract.selectors.outputNameParam = 'outputChannelName';
+                contract.parameters.run = {};
+                contract.parameters.static = {'focusSmoothZ','focusProjectionRadius','focusCenterCrop','overwrite','verbose','debug'};
+                contract.requirements.roi.required = true;
+                contract.requirements.roi.channelsMin = 1;
+                contract.binding.scope = 'roi';
+                contract.binding.outputScope = 'roi';
+                contract.binding.mode = 'channelSet';
+                contract.binding.selectorKeys = {'channels','channel'};
+                contract.binding.resolveAt = 'run';
+                contract.binding.outputChannelNameParam = 'outputChannelName';
+                contract.capabilities.roiChannels = true;
+                contract.capabilities.outputsChannels = true;
+                contract.capabilities.roiDataSeries = true;
+                contract.capabilities.outputsDataSeries = true;
+                contract.resources.in = resourceDef('channel', 'roi_image', 'channels', 'channels', 'channels', 'channels', false, '');
+                contract.resources.out = [ ...
+                    resourceDef('channel', 'best_focus_roi_image', 'focus', 'outputChannelName', 'channels', 'outputChannelName', false, 'roiChannel'), ...
+                    resourceDef('dataSeries', 'focus_z', 'dataSeries', 'zBestOutputName', 'dataSeries', 'zBestOutputName', false, 'roiDataSeries') ...
+                    ];
+                contract.summary = 'Selects or computes the best-focus ROI image plane and writes the derived ROI channel plus best-z dataseries.';
             case 'basicobjecttracking'
                 contract.out = [ ...
                     portDef('roiList', 'roiList', true, 'edge'), ...
@@ -1033,6 +1086,10 @@ function contract = applyExecutionSpecContract(contract, node)
 pkgName = char(string(getField(node, 'pkg', '')));
 if isempty(pkgName)
     return;
+end
+switch lower(strtrim(pkgName))
+    case 'detecdivpomegranate'
+        pkgName = 'detecdivPomegranate';
 end
 specFun = [pkgName '.executionSpec'];
 if isempty(which(specFun))
@@ -1192,6 +1249,11 @@ function n = combineMultipleChannelsSlotCount(node, maxSlots)
     if nargin < 2 || isempty(maxSlots)
         maxSlots = 5;
     end
+    mode = combineMultipleChannelsMode(node);
+    if any(strcmp(mode, {'subtraction','division'}))
+        n = 2;
+        return;
+    end
     n = maxSlots;
     params = getField(node, 'params', struct());
     if ~isstruct(params) || ~isfield(params, 'requiredChannelCount') || isempty(params.requiredChannelCount)
@@ -1206,6 +1268,30 @@ function n = combineMultipleChannelsSlotCount(node, maxSlots)
         return;
     end
     n = min(maxSlots, max(1, round(requested)));
+end
+
+function mode = combineMultipleChannelsMode(node)
+    mode = 'additive';
+    params = getField(node, 'params', struct());
+    if isstruct(params) && isfield(params, 'mode') && ~isempty(params.mode)
+        try
+            mode = lower(strtrim(char(string(params.mode))));
+        catch
+            mode = 'additive';
+        end
+    end
+    switch mode
+        case {'add','sum','rgb'}
+            mode = 'additive';
+        case {'subtract','difference'}
+            mode = 'subtraction';
+        case {'divide','ratio','quotient'}
+            mode = 'division';
+        case {'additive','subtraction','division'}
+            % keep
+        otherwise
+            mode = 'additive';
+    end
 end
 
 function keys = combineMultipleChannelsSlotKeys(prefix, n)
@@ -1238,11 +1324,7 @@ function n = dynamicSlotCount(node, names, defaultValue, minValue, maxValue)
         for i = 1:numel(names)
             key = char(string(names{i}));
             if isfield(params, key) && ~isempty(params.(key))
-                try
-                    requested = double(params.(key));
-                catch
-                    requested = NaN;
-                end
+                requested = numericScalarParamValue(params.(key));
                 if isscalar(requested) && isfinite(requested)
                     n = requested;
                     break;
@@ -1253,6 +1335,22 @@ function n = dynamicSlotCount(node, names, defaultValue, minValue, maxValue)
     n = min(maxValue, max(minValue, round(n)));
 end
 
+function value = numericScalarParamValue(raw)
+    value = NaN;
+    if isnumeric(raw) || islogical(raw)
+        candidate = double(raw);
+    elseif ischar(raw) || (isstring(raw) && isscalar(raw))
+        candidate = str2double(strtrim(char(string(raw))));
+    elseif iscell(raw) && numel(raw) == 1
+        candidate = numericScalarParamValue(raw{1});
+    else
+        candidate = NaN;
+    end
+    if isscalar(candidate) && isfinite(candidate)
+        value = candidate;
+    end
+end
+
 function keys = computeMetricsSlotKeys(prefix, suffix, n)
     keys = cell(1, n);
     for i = 1:n
@@ -1261,11 +1359,13 @@ function keys = computeMetricsSlotKeys(prefix, suffix, n)
 end
 
 function keys = computeMetricsMaskStaticKeys(n)
-    keys = {};
+    keys = {'backgroundMethod','backgroundPercentile','backgroundDilatePx'};
     for i = 1:n
         keys = [keys, { ...
             sprintf('mask%d_label', i), ...
-            sprintf('mask%d_stat', i)}]; %#ok<AGROW>
+            sprintf('mask%d_stat', i), ...
+            sprintf('mask%d_backgroundLabel', i), ...
+            sprintf('mask%d_scoreLabel', i)}]; %#ok<AGROW>
     end
 end
 
@@ -1600,6 +1700,18 @@ function keys = cellposeExecutionStaticKeys()
         keys = spec.staticKeys;
     catch
         keys = {'outputType','diameter','min_size','flow_threshold','cell_prob_threshold'};
+    end
+end
+
+function keys = sam31ExecutionStaticKeys()
+    try
+        spec = sam31.executionSpec();
+        keys = spec.staticKeys;
+    catch
+        keys = {'resolution','maxNumObjects','videoScoreThreshold', ...
+            'videoNewDetThreshold','videoAssocIouThreshold','sam31Runner', ...
+            'inferBudPairing','budPairingSourceKey','budPairingShowSource', ...
+            'budPairingActivateSource','budPairingWriteCanonical','budPairingOverwriteMotherOf'};
     end
 end
 

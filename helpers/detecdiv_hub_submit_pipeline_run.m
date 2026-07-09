@@ -7,44 +7,59 @@ function [job, runObj] = detecdiv_hub_submit_pipeline_run(runObj, shallowObj, va
     if nargin < 2
         shallowObj = [];
     end
+    opts = localRunStage('parse options', @() localParse(varargin{:}));
     projectArgClass = localClassName(shallowObj);
-    shallowObj = localResolveShallowProject(runObj, shallowObj);
-    if isempty(shallowObj)
+    classifierScopedRun = localIsClassifierScopedRun(runObj);
+    if classifierScopedRun
+        shallowObj = [];
+    else
+        shallowObj = localResolveShallowProject(runObj, shallowObj);
+    end
+    if isempty(shallowObj) && ~classifierScopedRun
         error('detecdiv_hub_submit_pipeline_run:MissingProject', ...
             'A shallow project is required. Received project argument class: %s.', projectArgClass);
     end
 
-    opts = localRunStage('parse options', @() localParse(varargin{:}));
-    ref = localRunStage('resolve hub project reference', @() detecdiv_hub_project_ref(shallowObj, opts.hub));
-    if isempty(ref.project_id)
-        [shallowObj, ref, ensureStatus] = localRunStage('ensure hub project registration', ...
-            @() detecdiv_hub_ensure_project(shallowObj, 'Hub', opts.hub, ...
-                'ErrorIfQueued', false, ...
-                'InitialWaitSec', opts.projectResolveInitialWaitSec, ...
-                'ResolveAttempts', opts.projectResolveAttempts, ...
-                'ResolveIntervalSec', opts.projectResolveIntervalSec));
-        if ~isempty(ref.project_id)
-            if opts.saveProject
-                localRunStageNoOutput('save project after hub registration check', @() localSaveProject(shallowObj, opts.hub));
-            end
+    if classifierScopedRun
+        opts.saveProject = false;
+        if isempty(opts.writeScope) || strcmpi(opts.writeScope, 'project_update')
+            opts.writeScope = 'classifier_update';
         end
-        if isempty(ref.project_id)
-            msg = ['This project is not registered in the Hub project catalogue, ' ...
-                'and direct project registration failed.' newline ...
-                char(string(ensureStatus.message)) newline ...
-                'No broad project-root indexing job was queued.'];
-            error('detecdiv_hub_submit_pipeline_run:ProjectRegistrationFailed', '%s', msg);
-        end
+        ref = localRunStage('resolve classifier-scoped run reference', @() localClassifierRunRef(runObj, opts.hub));
     else
-        [shallowObj, ref] = localRunStage('store resolved hub project reference', ...
-            @() detecdiv_hub_ensure_project(shallowObj, 'Hub', opts.hub, 'ResolveAttempts', 1));
-        if opts.saveProject
-            localRunStageNoOutput('save project after hub project resolution', @() localSaveProject(shallowObj, opts.hub));
+        ref = localRunStage('resolve hub project reference', @() detecdiv_hub_project_ref(shallowObj, opts.hub));
+        if isempty(ref.project_id)
+            [shallowObj, ref, ensureStatus] = localRunStage('ensure hub project registration', ...
+                @() detecdiv_hub_ensure_project(shallowObj, 'Hub', opts.hub, ...
+                    'ErrorIfQueued', false, ...
+                    'InitialWaitSec', opts.projectResolveInitialWaitSec, ...
+                    'ResolveAttempts', opts.projectResolveAttempts, ...
+                    'ResolveIntervalSec', opts.projectResolveIntervalSec));
+            if ~isempty(ref.project_id)
+                if opts.saveProject
+                    localRunStageNoOutput('save project after hub registration check', @() localSaveProject(shallowObj, opts.hub));
+                end
+            end
+            if isempty(ref.project_id)
+                msg = ['This project is not registered in the Hub project catalogue, ' ...
+                    'and direct project registration failed.' newline ...
+                    char(string(ensureStatus.message)) newline ...
+                    'No broad project-root indexing job was queued.'];
+                error('detecdiv_hub_submit_pipeline_run:ProjectRegistrationFailed', '%s', msg);
+            end
+        else
+            [shallowObj, ref] = localRunStage('store resolved hub project reference', ...
+                @() detecdiv_hub_ensure_project(shallowObj, 'Hub', opts.hub, 'ResolveAttempts', 1));
+            if opts.saveProject
+                localRunStageNoOutput('save project after hub project resolution', @() localSaveProject(shallowObj, opts.hub));
+            end
         end
     end
 
     payload = struct();
-    payload.project_id = ref.project_id;
+    if isfield(ref, 'project_id') && ~isempty(ref.project_id)
+        payload.project_id = ref.project_id;
+    end
     payload.requested_mode = opts.requestedMode;
     payload.priority = opts.priority;
     payload.requested_by = opts.requestedBy;
@@ -54,7 +69,9 @@ function [job, runObj] = detecdiv_hub_submit_pipeline_run(runObj, shallowObj, va
     payload.run_request = localRunStage('build run request payload', @() localBuildRunRequest(runObj, opts.hub, ref));
     payload.execution = localRunStage('build execution payload', @() localBuildExecution(opts));
 
-    localRunStageNoOutput('release local hub edit lease', @() detecdiv_hub_release_project_open(shallowObj, opts.hub));
+    if ~isempty(shallowObj)
+        localRunStageNoOutput('release local hub edit lease', @() detecdiv_hub_release_project_open(shallowObj, opts.hub));
+    end
     job = localRunStage('POST /pipeline-runs', @() detecdiv_hub_request('POST', '/pipeline-runs', payload, opts.hub));
     runObj = localRunStage('attach hub job to pipelineRun', @() localAttachHubJob(runObj, job, ref));
     localRunStageNoOutput('save pipelineRun after hub submit', @() localSavePipelineRun(runObj));
@@ -304,6 +321,137 @@ function msg = localLockHumanSummary(lockInfo)
     end
 end
 
+function tf = localIsClassifierScopedRun(runObj)
+    tf = false;
+    refs = {};
+    try
+        refs{end+1} = runObj.targetRef; %#ok<AGROW>
+    catch
+    end
+    try
+        if isstruct(runObj.ctx) && isfield(runObj.ctx, 'targetRef')
+            refs{end+1} = runObj.ctx.targetRef; %#ok<AGROW>
+        end
+    catch
+    end
+    for i = 1:numel(refs)
+        ref = refs{i};
+        if ~isstruct(ref)
+            continue;
+        end
+        typeText = lower(localText(localGetField(ref, 'type', '')));
+        classiPath = localText(localGetField(ref, 'classiPath', ''));
+        if strcmp(typeText, 'classi') || strcmp(typeText, 'classifier') || ~isempty(classiPath)
+            tf = true;
+            return;
+        end
+    end
+end
+
+function ref = localClassifierRunRef(runObj, hub)
+    classiPath = localClassifierPathFromRun(runObj);
+    if isempty(classiPath)
+        error('detecdiv_hub_submit_pipeline_run:MissingClassifierPath', ...
+            'Classifier-scoped Hub submission requires targetRef.classiPath or a classifier modulePath.');
+    end
+    [serverClassiPath, ~] = detecdiv_paths_map_module_path(classiPath, localPathMappingCtx(struct(), hub), 'server');
+    serverClassiPath = strrep(char(string(serverClassiPath)), '\', '/');
+    if localLooksLikeLocalClientPath(serverClassiPath)
+        error('detecdiv_hub_submit_pipeline_run:LocalClassifierPathForHub', ...
+            ['Classifier-scoped Hub training cannot use a local-only classifier path: %s\n' ...
+             'Use a server-visible/mapped classifier path, for example X:\\... mapped to /data/...'], classiPath);
+    end
+    if ~localLooksLikeServerPath(serverClassiPath)
+        error('detecdiv_hub_submit_pipeline_run:NonServerClassifierPathForHub', ...
+            'Classifier path is not server-visible after mapping: %s', serverClassiPath);
+    end
+
+    [~, classiId] = fileparts(regexprep(classiPath, '[\\\/]+$', ''));
+    ref = struct();
+    ref.scope = 'classifier';
+    ref.type = 'classi';
+    ref.project_id = '';
+    ref.project_key = '';
+    ref.project_name = classiId;
+    ref.project_mat_path = '';
+    ref.local_project_mat_path = '';
+    ref.local_project_dir_path = classiPath;
+    ref.project_dir_path = serverClassiPath;
+    ref.local_project_root_path = classiPath;
+    ref.project_root_path = serverClassiPath;
+    ref.local_classifier_path = classiPath;
+    ref.classifier_path = serverClassiPath;
+    ref.classifier_id = classiId;
+end
+
+function classiPath = localClassifierPathFromRun(runObj)
+    classiPath = '';
+    candidates = {};
+    try
+        candidates{end+1} = localGetField(runObj.targetRef, 'classiPath', ''); %#ok<AGROW>
+    catch
+    end
+    try
+        candidates{end+1} = localNested(runObj.ctx, {'targetRef','classiPath'}, ''); %#ok<AGROW>
+    catch
+    end
+    try
+        params = localNested(runObj.ctx, {'run','nodeParams'}, struct());
+        candidates = [candidates localClassifierModulePathsFromNodeParams(params)]; %#ok<AGROW>
+    catch
+    end
+    try
+        spec = localNested(runObj.ctx, {'pipelineSpec'}, struct());
+        if isstruct(spec) && isfield(spec, 'nodes')
+            for i = 1:numel(spec.nodes)
+                node = spec.nodes(i);
+                if ~strcmpi(localText(localGetField(node, 'type', '')), 'classifier')
+                    continue;
+                end
+                candidates{end+1} = localNested(node, {'params','modulePath'}, ''); %#ok<AGROW>
+                candidates{end+1} = localNested(node, {'origin','path'}, ''); %#ok<AGROW>
+            end
+        end
+    catch
+    end
+    for i = 1:numel(candidates)
+        candidate = localText(candidates{i});
+        if ~isempty(candidate)
+            classiPath = candidate;
+            return;
+        end
+    end
+end
+
+function paths = localClassifierModulePathsFromNodeParams(nodeParams)
+    paths = {};
+    if isempty(nodeParams)
+        return;
+    end
+    if iscell(nodeParams)
+        for i = 1:numel(nodeParams)
+            paths = [paths localClassifierModulePathsFromNodeParams(nodeParams{i})]; %#ok<AGROW>
+        end
+        return;
+    end
+    if ~isstruct(nodeParams)
+        return;
+    end
+    if isfield(nodeParams, 'id') && isfield(nodeParams, 'params')
+        for i = 1:numel(nodeParams)
+            p = nodeParams(i).params;
+            if isstruct(p) && isfield(p, 'modulePath') && ~isempty(p.modulePath)
+                paths{end+1} = p.modulePath; %#ok<AGROW>
+            end
+        end
+        return;
+    end
+    fields = fieldnames(nodeParams);
+    for i = 1:numel(fields)
+        paths = [paths localClassifierModulePathsFromNodeParams(nodeParams.(fields{i}))]; %#ok<AGROW>
+    end
+end
+
 function msg = localLockResolutionHint(lockInfo)
     if strcmpi(lockInfo.lockKind, 'client_edit_lease')
         msg = ['A new Hub run cannot be submitted while a DetecDiv client holds an edit lease on this project.' newline ...
@@ -320,7 +468,7 @@ function opts = localParse(varargin)
     opts = struct();
     opts.hub = detecdiv_hub_settings_get();
     opts.requestedMode = 'server';
-    opts.priority = 100;
+    opts.priority = 10;
     opts.requestedBy = '';
     opts.executionTargetId = '';
     opts.saveProject = true;
@@ -378,6 +526,20 @@ end
 
 function projectRef = localBuildProjectRef(ref, hub)
     projectRef = struct();
+    if isstruct(ref) && isfield(ref, 'scope') && strcmpi(char(string(ref.scope)), 'classifier')
+        projectRef.scope = 'classifier';
+        projectRef.type = 'classi';
+        projectRef.project_name = localText(localGetField(ref, 'project_name', ''));
+        projectRef.classifier_id = localText(localGetField(ref, 'classifier_id', projectRef.project_name));
+        projectRef.classifier_path = localText(localGetField(ref, 'classifier_path', ''));
+        if isempty(projectRef.classifier_path)
+            localClassifierPath = localText(localGetField(ref, 'local_classifier_path', ''));
+            if ~isempty(localClassifierPath)
+                projectRef.classifier_path = localTranslatePathForServer(localClassifierPath, ref, hub);
+            end
+        end
+        return;
+    end
     projectRef.project_id = ref.project_id;
     projectRef.project_key = ref.project_key;
     projectRef.project_name = ref.project_name;
@@ -390,6 +552,7 @@ function projectRef = localBuildProjectRef(ref, hub)
 end
 
 function pipelineRef = localBuildPipelineRef(runObj, ref, hub, shallowObj)
+    %#ok<INUSD>
     pipelineRef = struct();
     pipelineRef.pipeline_key = '';
     pipelineRef.pipeline_bundle_uri = '';
@@ -414,19 +577,17 @@ function pipelineRef = localBuildPipelineRef(runObj, ref, hub, shallowObj)
         catch
         end
     end
-    try
+    if isempty(pipelineRef.pipeline_json_path) || localLooksLikeLocalClientPath(pipelineRef.pipeline_json_path) || ~localLooksLikeServerPath(pipelineRef.pipeline_json_path)
         bundleRef = localExportRunPipelineBundle(runObj, ref, hub, shallowObj);
-        if ~isempty(bundleRef.pipeline_json_path)
-            pipelineRef.pipeline_bundle_uri = bundleRef.pipeline_bundle_uri;
-            pipelineRef.export_manifest_uri = bundleRef.export_manifest_uri;
-            pipelineRef.pipeline_json_path = bundleRef.pipeline_json_path;
+        if ~isempty(localText(localGetField(bundleRef, 'pipeline_json_path', '')))
+            pipelineRef.pipeline_bundle_uri = localText(localGetField(bundleRef, 'pipeline_bundle_uri', ''));
+            pipelineRef.export_manifest_uri = localText(localGetField(bundleRef, 'export_manifest_uri', ''));
+            pipelineRef.pipeline_json_path = localText(localGetField(bundleRef, 'pipeline_json_path', ''));
         end
-    catch ME
-        error('detecdiv_hub_submit_pipeline_run:PipelineBundleExportFailed', ...
-            ['Unable to export a server-visible Hub pipeline bundle. ' ...
-             'Hub submission was stopped before sending a local pipeline path to the worker: %s'], ME.message);
     end
     localAssertServerVisiblePipelineRef(pipelineRef);
+    localAssertPipelineNodeLinksServerVisible(runObj, ref, hub);
+    pipelineRef.link_mode = 'server_visible';
 end
 
 function localAssertServerVisiblePipelineRef(pipelineRef)
@@ -437,12 +598,12 @@ function localAssertServerVisiblePipelineRef(pipelineRef)
     if isempty(pipelinePath)
         error('detecdiv_hub_submit_pipeline_run:MissingServerPipelineRef', ...
             ['Hub submission requires a server-visible pipeline JSON path. ' ...
-             'Export a Hub pipeline bundle before submitting the run.']);
+             'Save the pipeline template under a path visible to the worker, or configure a Hub path mapping.']);
     end
     if localLooksLikeLocalClientPath(pipelinePath)
         error('detecdiv_hub_submit_pipeline_run:LocalPipelinePathForHub', ...
             ['Hub submission would send a local client pipeline path to the worker: %s\n' ...
-             'The pipeline must be exported to the run hub_pipeline_bundle first.'], pipelinePath);
+             'Move the pipeline template under a mapped/server-visible path before launching on the Hub.'], pipelinePath);
     end
     if ~localLooksLikeServerPath(pipelinePath)
         error('detecdiv_hub_submit_pipeline_run:NonServerPipelinePathForHub', ...
@@ -455,6 +616,39 @@ function localAssertServerVisiblePipelineRef(pipelineRef)
     end
 end
 
+function localAssertPipelineNodeLinksServerVisible(runObj, ref, hub)
+    spec = localRunPipelineExportSource(runObj);
+    if isempty(spec) || ~isstruct(spec) || ~isfield(spec, 'nodes') || isempty(spec.nodes)
+        return;
+    end
+    for i = 1:numel(spec.nodes)
+        node = spec.nodes(i);
+        nodeId = localText(localGetField(node, 'id', sprintf('node_%d', i)));
+        modulePath = localText(localNested(node, {'params','modulePath'}, ''));
+        localAssertLinkedPathServerVisible(modulePath, sprintf('node %s params.modulePath', nodeId), ref, hub);
+        originPath = localText(localNested(node, {'origin','path'}, ''));
+        localAssertLinkedPathServerVisible(originPath, sprintf('node %s origin.path', nodeId), ref, hub);
+    end
+end
+
+function localAssertLinkedPathServerVisible(pathValue, label, ref, hub)
+    pathValue = localText(pathValue);
+    if isempty(pathValue)
+        return;
+    end
+    serverPath = localTranslatePathForServer(pathValue, ref, hub);
+    if localLooksLikeLocalClientPath(serverPath)
+        error('detecdiv_hub_submit_pipeline_run:LocalLinkedPathForHub', ...
+            ['Hub submission would send a local client-linked path for %s: %s\n' ...
+             'Move this resource under a mapped/server-visible path before launching on the Hub.'], ...
+            label, pathValue);
+    end
+    if ~localLooksLikeServerPath(serverPath)
+        error('detecdiv_hub_submit_pipeline_run:NonServerLinkedPathForHub', ...
+            'Hub-linked path for %s is not server-visible after mapping: %s', label, serverPath);
+    end
+end
+
 function exportSource = localRunPipelineExportSource(runObj)
     if isstruct(runObj.ctx) && isfield(runObj.ctx, 'pipelineSpec') && isstruct(runObj.ctx.pipelineSpec) && ...
             isfield(runObj.ctx.pipelineSpec, 'nodes') && ~isempty(runObj.ctx.pipelineSpec.nodes)
@@ -463,7 +657,7 @@ function exportSource = localRunPipelineExportSource(runObj)
     end
     error('detecdiv_hub_submit_pipeline_run:MissingRunPipelineSpec', ...
         ['Hub submission requires the effective pipeline spec stored on the pipelineRun. ' ...
-         'Rebuild or save the run before submitting so the Hub bundle can be created from the run-specific node parameters.']);
+         'Rebuild or save the run before submitting so the Hub can send the run-specific node parameters.']);
 end
 
 function spec = localPipelineSpecForSelectedRunNodes(spec, selectedIds)
@@ -619,8 +813,11 @@ function bundleRef = localExportRunPipelineBundle(runObj, ref, hub, shallowObj)
     end
     % Rebuild on every Hub submission. A previous bundle can have the same
     % node ids but stale classifier/processor module contents or paths.
+    includeTrainingData = localRunIntentIsTraining(runObj);
     pipelineExport(exportSource, bundlePath, ...
         'projectObj', shallowObj, ...
+        'includeTrainingData', includeTrainingData, ...
+        'includeTrainingRois', false, ...
         'overwrite', true);
     localPruneHubBundleForRun(bundlePath, runObj);
     localRepairHubPipelineBundlePaths(bundlePath, pipelineJsonPath, ref, hub);
@@ -649,10 +846,15 @@ function report = localRepairHubPipelineBundlePaths(bundlePath, pipelineJsonPath
     pipelineDir = fileparts(pipelineJsonPath);
     for i = 1:numel(spec.nodes)
         [nodeOut, nodeReport] = localRepairHubBundleNodePaths(spec.nodes(i), bundlePath, pipelineDir, ref, hub);
+        [nodeOut, pluginReport] = localRepairHubBundlePluginLink(nodeOut, bundlePath, pipelineDir, ref, hub);
         spec.nodes(i) = nodeOut;
         if nodeReport.changed
             report.changed = true;
             report.rewrites = [report.rewrites nodeReport.rewrites]; %#ok<AGROW>
+        end
+        if pluginReport.changed
+            report.changed = true;
+            report.rewrites = [report.rewrites pluginReport.rewrites]; %#ok<AGROW>
         end
     end
 
@@ -660,6 +862,86 @@ function report = localRepairHubPipelineBundlePaths(bundlePath, pipelineJsonPath
         localWriteJsonFile(pipelineJsonPath, spec);
         fprintf('[hub-submit] Rewrote %d bundle module path(s) relative to %s.\n', ...
             numel(report.rewrites), pipelineJsonPath);
+    end
+end
+
+function [node, report] = localRepairHubBundlePluginLink(node, bundlePath, pipelineDir, ref, hub)
+    report = struct('changed', false, 'rewrites', {{}});
+    if ~isstruct(node)
+        return;
+    end
+    nodeType = lower(localText(localGetField(node, 'type', '')));
+    if ~any(strcmp(nodeType, {'processor','classifier'}))
+        return;
+    end
+    customDir = localText(localGetField(node, 'customPackageDir', ''));
+    customRoot = localText(localGetField(node, 'customPackageRoot', ''));
+    params = localGetField(node, 'params', struct());
+    if isempty(customDir) && isstruct(params)
+        customDir = localText(localGetField(params, 'customPackageDir', ''));
+    end
+    if isempty(customRoot) && isstruct(params)
+        customRoot = localText(localGetField(params, 'customPackageRoot', ''));
+    end
+    if isempty(customDir) && isempty(customRoot)
+        return;
+    end
+    pkg = localText(localGetField(node, 'pkg', ''));
+    if isempty(pkg) && isstruct(params)
+        pkg = localText(localGetField(params, 'pkg', ''));
+    end
+    packagePath = customDir;
+    if isempty(packagePath) && ~isempty(customRoot) && ~isempty(pkg)
+        packagePath = fullfile(customRoot, ['+' pkg]);
+    end
+    if isempty(packagePath)
+        return;
+    end
+    resolved = localResolveJsonPathForBundle(packagePath, pipelineDir, ref, hub);
+    if ~isempty(resolved) && localPathInside(resolved, bundlePath) && exist(resolved, 'dir') == 7
+        return;
+    end
+
+    node = localRemoveCustomPackageFields(node);
+    report.changed = true;
+    report.rewrites{end+1} = struct( ...
+        'field', [localText(localGetField(node, 'id', 'node')) '.customPackageDir'], ...
+        'from', packagePath, ...
+        'to', '<server plugin registry>');
+end
+
+function node = localRemoveCustomPackageFields(node)
+    keys = {'customPackageRoot','customPackageDir','customPackageLoadedAt'};
+    for i = 1:numel(keys)
+        key = keys{i};
+        if isfield(node, key)
+            node.(key) = '';
+        end
+    end
+    if isfield(node, 'params') && isstruct(node.params)
+        for i = 1:numel(keys)
+            key = keys{i};
+            if isfield(node.params, key)
+                node.params = rmfield(node.params, key);
+            end
+        end
+    end
+end
+
+function pathOut = localResolveJsonPathForBundle(pathText, pipelineDir, ref, hub)
+    pathOut = char(string(pathText));
+    if isempty(pathOut)
+        return;
+    end
+    if startsWith(pathOut, './') || startsWith(pathOut, '../')
+        pathOut = fullfile(pipelineDir, pathOut);
+    end
+    try
+        [mappedPath, mapped] = detecdiv_paths_map_module_path(pathOut, localPathMappingCtx(ref, hub), 'local');
+        if mapped
+            pathOut = mappedPath;
+        end
+    catch
     end
 end
 
@@ -939,6 +1221,59 @@ function localPruneHubBundleForRun(bundlePath, runObj)
     localPruneBundlePipeline(pipelineJsonPath, selectedIds);
 end
 
+function tf = localRunIntentIsTraining(runObj)
+    tf = false;
+    candidates = {};
+    try
+        candidates{end+1} = localNested(runObj.ctx, {'run','intent'}, ''); %#ok<AGROW>
+        candidates{end+1} = localNested(runObj.ctx, {'run','classifierIntent'}, ''); %#ok<AGROW>
+    catch
+    end
+    try
+        nodeParams = localNested(runObj.ctx, {'run','nodeParams'}, struct());
+        candidates = [candidates localTrainingIntentCandidatesFromNodeParams(nodeParams)]; %#ok<AGROW>
+    catch
+    end
+    for i = 1:numel(candidates)
+        txt = lower(strtrim(localText(candidates{i})));
+        if any(strcmp(txt, {'train','training','fit'}))
+            tf = true;
+            return;
+        end
+    end
+end
+
+function values = localTrainingIntentCandidatesFromNodeParams(nodeParams)
+    values = {};
+    if isempty(nodeParams)
+        return;
+    end
+    if iscell(nodeParams)
+        for i = 1:numel(nodeParams)
+            values = [values localTrainingIntentCandidatesFromNodeParams(nodeParams{i})]; %#ok<AGROW>
+        end
+        return;
+    end
+    if ~isstruct(nodeParams)
+        return;
+    end
+    if isfield(nodeParams, 'id') && isfield(nodeParams, 'params')
+        for i = 1:numel(nodeParams)
+            p = nodeParams(i).params;
+            if ~isstruct(p)
+                continue;
+            end
+            values{end+1} = localGetField(p, 'intent', ''); %#ok<AGROW>
+            values{end+1} = localGetField(p, 'operation', ''); %#ok<AGROW>
+        end
+        return;
+    end
+    fields = fieldnames(nodeParams);
+    for i = 1:numel(fields)
+        values = [values localTrainingIntentCandidatesFromNodeParams(nodeParams.(fields{i}))]; %#ok<AGROW>
+    end
+end
+
 function selectedIds = localSelectedRunNodeIds(runObj)
     selectedIds = {};
     candidates = {};
@@ -1212,9 +1547,21 @@ function runRequest = localBuildRunRequest(runObj, hub, ref)
     runRequest = struct();
     runRequest.run_id = char(string(runObj.runId));
     runRequest.description = char(string(runObj.description));
+    intent = localText(localNested(ctx, {'run','intent'}, localNested(ctx, {'run','classifierIntent'}, '')));
+    if isempty(intent)
+        intent = localInferRunIntentFromNodeParams(localNested(ctx, {'run','nodeParams'}, struct()));
+    end
+    if ~isempty(intent)
+        runRequest.intent = intent;
+        runRequest.classifier_intent = intent;
+    end
     runRequest.selected_nodes = localCellText(localNested(ctx, {'run','selectedNodes'}, {}));
+    nodeParams = localNested(ctx, {'run','nodeParams'}, struct());
+    if localNodeParamsEmpty(nodeParams)
+        nodeParams = localNodeParamsFromPipelineSpec(localNested(ctx, {'pipelineSpec'}, struct()), runRequest.selected_nodes);
+    end
     runRequest.node_params = localBuildNodeParamsList( ...
-        localNested(ctx, {'run','nodeParams'}, struct()), runRequest.selected_nodes, ref, hub);
+        nodeParams, runRequest.selected_nodes, ref, hub);
     runRequest.run_policy = localText(localNested(ctx, {'run','runPolicy'}, 'resume'));
     runRequest.input_source = localText(localNested(ctx, {'run','inputSource'}, ''));
     localValidateInputSourceForSelectedNodes(runRequest.input_source, runRequest.selected_nodes, ctx, runObj);
@@ -1233,6 +1580,66 @@ function runRequest = localBuildRunRequest(runObj, hub, ref)
     runRequest.control = localBuildRunControl(ctx);
     runRequest.python = localNested(ctx, {'exec','python'}, struct());
     runRequest.gpu = struct('mode', localText(localNested(ctx, {'run','gpuPolicy'}, localNested(ctx, {'exec','gpuPolicy'}, 'module_default'))));
+    localAssertNoLocalClientPathsInValue(runRequest, 'run_request');
+end
+
+function intent = localInferRunIntentFromNodeParams(nodeParams)
+    intent = '';
+    candidates = localTrainingIntentCandidatesFromNodeParams(nodeParams);
+    for i = 1:numel(candidates)
+        txt = lower(strtrim(localText(candidates{i})));
+        switch txt
+            case {'train','training','fit'}
+                intent = 'train';
+                return;
+            case {'validate','validation','val','test','evaluate','eval'}
+                if isempty(intent)
+                    intent = 'validate';
+                end
+        end
+    end
+end
+
+function tf = localNodeParamsEmpty(nodeParams)
+    tf = true;
+    if isempty(nodeParams)
+        return;
+    end
+    if isstruct(nodeParams)
+        try
+            tf = isempty(fieldnames(nodeParams));
+        catch
+            tf = true;
+        end
+    elseif iscell(nodeParams)
+        tf = isempty(nodeParams);
+    else
+        tf = true;
+    end
+end
+
+function nodeParams = localNodeParamsFromPipelineSpec(spec, selectedNodes)
+    nodeParams = struct();
+    if isempty(spec) || ~isstruct(spec) || ~isfield(spec, 'nodes') || isempty(spec.nodes)
+        return;
+    end
+    selectedNodes = localCellText(selectedNodes);
+    nodes = spec.nodes;
+    for i = 1:numel(nodes)
+        nodeId = localText(localGetField(nodes(i), 'id', ''));
+        if isempty(nodeId)
+            continue;
+        end
+        if ~isempty(selectedNodes) && ~any(strcmp(selectedNodes, nodeId))
+            continue;
+        end
+        params = localGetField(nodes(i), 'params', struct());
+        if ~isstruct(params)
+            params = struct();
+        end
+        key = matlab.lang.makeValidName(nodeId);
+        nodeParams.(key) = params;
+    end
 end
 
 function localValidateInputSourceForSelectedNodes(inputSource, selectedNodes, ctx, runObj)
@@ -1424,6 +1831,38 @@ function item = localNormalizeNodeParamEntry(value, fallbackId, ref, hub)
         'params', localTranslateValuePathsForServer(params, ref, hub));
 end
 
+function localAssertNoLocalClientPathsInValue(value, label)
+    if isstruct(value)
+        for i = 1:numel(value)
+            names = fieldnames(value(i));
+            for j = 1:numel(names)
+                localAssertNoLocalClientPathsInValue(value(i).(names{j}), [label '.' names{j}]);
+            end
+        end
+    elseif iscell(value)
+        for i = 1:numel(value)
+            localAssertNoLocalClientPathsInValue(value{i}, sprintf('%s{%d}', label, i));
+        end
+    elseif isstring(value)
+        for i = 1:numel(value)
+            localAssertNoLocalClientPathText(char(value(i)), sprintf('%s(%d)', label, i));
+        end
+    elseif ischar(value)
+        localAssertNoLocalClientPathText(value, label);
+    end
+end
+
+function localAssertNoLocalClientPathText(value, label)
+    value = char(string(value));
+    if isempty(value) || ~localLooksLikeLocalClientPath(value)
+        return;
+    end
+    error('detecdiv_hub_submit_pipeline_run:LocalPathInHubPayload', ...
+        ['Hub submission would send a local client path in %s: %s\n' ...
+         'Move/map the resource so the worker can access it, or launch locally.'], ...
+        label, value);
+end
+
 function paths = localBuildRunPaths(ctx, ref, hub)
     rawDataPath = localText(localNested(ctx, {'run','rawDataPath'}, localNested(ctx, {'io','rawDataPath'}, localNested(ctx, {'rawDataPath'}, ''))));
     projectPath = localText(localNested(ctx, {'run','projectPath'}, localNested(ctx, {'io','projectPath'}, localNested(ctx, {'projectPath'}, ''))));
@@ -1438,7 +1877,36 @@ function paths = localBuildRunPaths(ctx, ref, hub)
     if isempty(paths.server_project_path) && ~isempty(projectPath)
         paths.server_project_path = localTranslatePathForServer(projectPath, ref, hub);
     end
+    if ~isempty(paths.server_raw_data_path)
+        paths.raw_data_path = paths.server_raw_data_path;
+    end
+    if ~isempty(paths.server_project_path)
+        paths.project_path = paths.server_project_path;
+    end
     paths.server_project_data_folder = localText(localNested(ctx, {'run','serverProjectDataFolder'}, localNested(ctx, {'io','serverProjectDataFolder'}, '')));
+    classifierPath = localText(localNested(ctx, {'targetRef','classiPath'}, localNested(ctx, {'run','classiPath'}, '')));
+    if isempty(classifierPath) && isstruct(ref) && isfield(ref, 'local_classifier_path')
+        classifierPath = localText(ref.local_classifier_path);
+    end
+    paths.classifier_path = classifierPath;
+    paths.server_classifier_path = '';
+    if ~isempty(classifierPath)
+        paths.server_classifier_path = localTranslatePathForServer(classifierPath, ref, hub);
+    elseif isstruct(ref) && isfield(ref, 'classifier_path')
+        paths.server_classifier_path = localText(ref.classifier_path);
+    end
+    if ~isempty(paths.server_classifier_path)
+        paths.classifier_path = paths.server_classifier_path;
+    end
+    runPath = localText(localNested(ctx, {'run','runPath'}, localNested(ctx, {'run','path'}, localNested(ctx, {'store','runPath'}, ''))));
+    paths.run_path = runPath;
+    paths.server_run_path = '';
+    if ~isempty(runPath)
+        paths.server_run_path = localTranslatePathForServer(runPath, ref, hub);
+    end
+    if ~isempty(paths.server_run_path)
+        paths.run_path = paths.server_run_path;
+    end
     paths.path_mappings = localHubPathMappings(hub);
 end
 
@@ -1476,7 +1944,22 @@ function tf = localLooksLikePathText(value)
 end
 
 function mappings = localHubPathMappings(hub)
-    mappings = detecdiv_paths_module_mappings(localPathMappingCtx(struct(), hub));
+    raw = detecdiv_paths_module_mappings(localPathMappingCtx(struct(), hub));
+    mappings = struct('localRoot', {}, 'remoteRoot', {});
+    if isempty(raw)
+        return;
+    end
+    for i = 1:numel(raw)
+        try
+            remoteRoot = regexprep(strrep(char(string(raw(i).remoteRoot)), '\', '/'), '[\/]+$', '');
+            if isempty(remoteRoot) || ~localLooksLikeServerPath(remoteRoot)
+                continue;
+            end
+            mappings(end+1).localRoot = remoteRoot; %#ok<AGROW>
+            mappings(end).remoteRoot = remoteRoot;
+        catch
+        end
+    end
 end
 
 function ctx = localPathMappingCtx(ref, hub)
@@ -1549,12 +2032,16 @@ function runObj = localAttachHubJob(runObj, job, ref)
     if ~isfield(runObj.ctx, 'hub') || ~isstruct(runObj.ctx.hub)
         runObj.ctx.hub = struct();
     end
-    runObj.ctx.hub.project_id = ref.project_id;
-    runObj.ctx.hub.project_key = ref.project_key;
+    runObj.ctx.hub.project_id = localText(localGetField(ref, 'project_id', ''));
+    runObj.ctx.hub.project_key = localText(localGetField(ref, 'project_key', ''));
     runObj.ctx.hub.job_id = char(string(job.id));
     runObj.ctx.hub.status = char(string(job.status));
     runObj.ctx.hub.submitted_at = char(datetime('now'));
-    runObj.ctx.hub.project_stale_after_job = true;
+    runObj.ctx.hub.project_stale_after_job = ~isempty(runObj.ctx.hub.project_id);
+    if isfield(ref, 'scope') && strcmpi(char(string(ref.scope)), 'classifier')
+        runObj.ctx.hub.scope = 'classifier';
+        runObj.ctx.hub.classifier_path = localText(localGetField(ref, 'classifier_path', ''));
+    end
     runObj.status = ['hub_' char(string(job.status))];
 end
 

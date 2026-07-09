@@ -27,12 +27,17 @@ function result = detecdiv_run_pipeline_job(jobInput)
     resultPath = localGetText(payload, {'execution','result_json_path'}, '');
 
     try
-        projectMatPath = localResolveProjectMatPath(payload);
-        [shallowObj, msg] = shallowLoad(projectMatPath);
-        if isempty(shallowObj)
-            error('detecdiv_run_pipeline_job:ProjectLoadFailed', '%s', msg);
+        classifierScopedRun = localIsClassifierScopedPayload(payload);
+        projectMatPath = '';
+        shallowObj = [];
+        if ~classifierScopedRun
+            projectMatPath = localResolveProjectMatPath(payload);
+            [shallowObj, msg] = shallowLoad(projectMatPath);
+            if isempty(shallowObj)
+                error('detecdiv_run_pipeline_job:ProjectLoadFailed', '%s', msg);
+            end
+            shallowObj = localRelinkRawPaths(shallowObj, payload);
         end
-        shallowObj = localRelinkRawPaths(shallowObj, payload);
 
         pipelineInputPath = localResolvePipelineInputPath(payload);
         [pipeObj, msg] = pipelineLoad(pipelineInputPath);
@@ -40,10 +45,17 @@ function result = detecdiv_run_pipeline_job(jobInput)
             error('detecdiv_run_pipeline_job:PipelineLoadFailed', '%s', msg);
         end
         ctx = localBuildExecutionContext(payload, shallowObj, pipeObj);
+        if classifierScopedRun
+            ctx = localAttachClassifierScopedRuntime(ctx, pipeObj, payload);
+        end
         dependencyAudit = pipelineAuditDependencies(pipeObj, 'Mode', 'run', 'Context', ctx);
         runId = char(string(localGetText(payload, {'run_request','run_id'}, '')));
         if isempty(runId)
-            runId = localSuggestRunId(shallowObj, pipeObj.strid);
+            if classifierScopedRun
+                runId = localSuggestClassifierScopedRunId(pipeObj.strid);
+            else
+                runId = localSuggestRunId(shallowObj, pipeObj.strid);
+            end
         end
         ctx.runId = runId;
         if ~isfield(ctx, 'run') || ~isstruct(ctx.run)
@@ -246,7 +258,9 @@ function pipelineInputPath = localResolvePipelineInputPath(payload)
     for i = 1:numel(keys)
         candidates = localAppendPathCandidate(candidates, localGetText(payload, keys{i}, ''), payload);
     end
-    candidates = localAppendPipelineSiblingCandidates(candidates, payload);
+    if ~localIsClassifierScopedPayload(payload)
+        candidates = localAppendPipelineSiblingCandidates(candidates, payload);
+    end
     pipelineInputPath = localFirstExistingPath(unique(candidates, 'stable'));
     if isempty(pipelineInputPath)
         error('detecdiv_run_pipeline_job:MissingPipelinePath', ...
@@ -345,27 +359,316 @@ function leaf = localPathLeaf(pathText)
     end
 end
 
+function tf = localIsClassifierScopedPayload(payload)
+    scope = lower(strtrim(localGetText(payload, {'project_ref','scope'}, ...
+        localGetText(payload, {'project_ref','type'}, ''))));
+    inputSource = lower(strtrim(localGetText(payload, {'run_request','input_source'}, '')));
+    classiPath = localClassifierPathFromPayload(payload);
+    tf = ~isempty(classiPath) && (any(strcmp(scope, {'classifier','classi'})) || contains(inputSource, 'classifier'));
+end
+
+function classiPath = localClassifierPathFromPayload(payload)
+    candidates = { ...
+        localGetText(payload, {'run_request','paths','server_classifier_path'}, ''), ...
+        localGetText(payload, {'project_ref','classifier_path'}, ''), ...
+        localGetText(payload, {'run_request','paths','classifier_path'}, ''), ...
+        localGetText(payload, {'project_ref','local_classifier_path'}, '')};
+    classiPath = '';
+    for i = 1:numel(candidates)
+        candidate = localTranslatePathForWorker(candidates{i}, payload);
+        if ~isempty(candidate)
+            classiPath = candidate;
+            return;
+        end
+    end
+end
+
+function ctx = localAttachClassifierScopedRuntime(ctx, pipeObj, payload)
+    if isfield(ctx, 'roiList') && ~isempty(ctx.roiList) && isa(ctx.roiList, 'roi')
+        return;
+    end
+    [classiObj, snapPath] = localLoadClassifierForScopedRun(pipeObj, ctx, payload);
+    if isempty(classiObj) || ~isa(classiObj, 'classi')
+        error('detecdiv_run_pipeline_job:ClassifierScopedLoadFailed', ...
+            'Classifier-scoped run could not load the classifier snapshot.');
+    end
+    rois = classiObj.roi;
+    if isempty(rois)
+        error('detecdiv_run_pipeline_job:ClassifierScopedNoRoi', ...
+            'Classifier-scoped run loaded %s but it contains no ROI.', snapPath);
+    end
+    idx = [];
+    try
+        if isfield(ctx, 'sel') && isstruct(ctx.sel) && isfield(ctx.sel, 'rois') && ~isempty(ctx.sel.rois)
+            idx = ctx.sel.rois;
+        end
+    catch
+        idx = [];
+    end
+    if isempty(idx)
+        idx = localDefaultClassifierRoiSelection(classiObj, ctx);
+    end
+    if ~isempty(idx)
+        idx = idx(idx >= 1 & idx <= numel(rois));
+        rois = rois(idx);
+    end
+    ctx.roiList = rois;
+    ctx.rois = rois;
+    if ~isfield(ctx, 'store') || ~isstruct(ctx.store)
+        ctx.store = struct();
+    end
+    ctx.store.classifierScoped = struct( ...
+        'snapshot', snapPath, ...
+        'classifierPath', classiObj.path, ...
+        'roiCount', numel(rois));
+    if ~isfield(ctx, 'run') || ~isstruct(ctx.run)
+        ctx.run = struct();
+    end
+    ctx.run.runtimeInventoryMode = 'classifier_snapshot';
+end
+
+function [classiObj, snapPath] = localLoadClassifierForScopedRun(pipeObj, ctx, payload)
+    classiObj = [];
+    snapPath = '';
+    refs = localClassifierModuleRefs(pipeObj, ctx, payload);
+    for i = 1:numel(refs)
+        modulePath = localResolveScopedModulePath(refs(i).modulePath, ctx, payload);
+        if isempty(modulePath) || exist(modulePath, 'dir') ~= 7
+            continue;
+        end
+        snapPath = localClassifierSnapshotPath(modulePath, refs(i).moduleId);
+        if isempty(snapPath) || exist(snapPath, 'file') ~= 2
+            continue;
+        end
+        try
+            [classiObj, ~] = classiLoad(snapPath);
+        catch
+            classiObj = [];
+        end
+        if ~isempty(classiObj) && isa(classiObj, 'classi')
+            return;
+        end
+    end
+    snapPath = '';
+end
+
+function refs = localClassifierModuleRefs(pipeObj, ctx, payload)
+    refs = struct('modulePath', {}, 'moduleId', {});
+    payloadPath = localClassifierPathFromPayload(payload);
+    if ~isempty(payloadPath)
+        refs(end+1) = struct('modulePath', payloadPath, 'moduleId', localPathLeaf(payloadPath)); %#ok<AGROW>
+    end
+    try
+        params = localGetField(ctx.run, 'nodeParams', struct());
+        refs = [refs localClassifierModuleRefsFromNodeParams(params)]; %#ok<AGROW>
+    catch
+    end
+    try
+        nodes = pipeObj.nodes;
+        for i = 1:numel(nodes)
+            nodeType = lower(strtrim(char(string(localGetField(nodes(i), 'type', '')))));
+            if ~strcmp(nodeType, 'classifier')
+                continue;
+            end
+            p = localGetField(nodes(i), 'params', struct());
+            modulePath = localGetField(p, 'modulePath', '');
+            moduleId = localGetField(p, 'moduleId', '');
+            if isempty(modulePath)
+                modulePath = localGetText(nodes(i), {'origin','path'}, '');
+            end
+            if isempty(moduleId)
+                moduleId = localGetText(nodes(i), {'origin','id'}, '');
+            end
+            if ~isempty(modulePath)
+                refs(end+1) = struct('modulePath', modulePath, 'moduleId', moduleId); %#ok<AGROW>
+            end
+        end
+    catch
+    end
+end
+
+function refs = localClassifierModuleRefsFromNodeParams(nodeParams)
+    refs = struct('modulePath', {}, 'moduleId', {});
+    if isempty(nodeParams)
+        return;
+    end
+    if iscell(nodeParams)
+        for i = 1:numel(nodeParams)
+            refs = [refs localClassifierModuleRefsFromNodeParams(nodeParams{i})]; %#ok<AGROW>
+        end
+        return;
+    end
+    if ~isstruct(nodeParams)
+        return;
+    end
+    if isfield(nodeParams, 'id') && isfield(nodeParams, 'params')
+        for i = 1:numel(nodeParams)
+            p = nodeParams(i).params;
+            if ~isstruct(p) || ~isfield(p, 'modulePath') || isempty(p.modulePath)
+                continue;
+            end
+            refs(end+1) = struct( ...
+                'modulePath', p.modulePath, ...
+                'moduleId', localGetField(p, 'moduleId', '')); %#ok<AGROW>
+        end
+        return;
+    end
+    names = fieldnames(nodeParams);
+    for i = 1:numel(names)
+        refs = [refs localClassifierModuleRefsFromNodeParams(nodeParams.(names{i}))]; %#ok<AGROW>
+    end
+end
+
+function modulePath = localResolveScopedModulePath(pathText, ctx, payload)
+    modulePath = localTranslatePathForWorker(pathText, payload);
+    if isempty(modulePath)
+        return;
+    end
+    if exist(modulePath, 'dir') == 7
+        return;
+    end
+    if localIsAbsolutePath(modulePath)
+        return;
+    end
+    bases = localPipelineBaseDirs(ctx, payload);
+    for i = 1:numel(bases)
+        candidate = fullfile(bases{i}, modulePath);
+        if exist(candidate, 'dir') == 7
+            modulePath = candidate;
+            return;
+        end
+    end
+end
+
+function bases = localPipelineBaseDirs(ctx, payload)
+    bases = {};
+    candidates = { ...
+        localGetText(payload, {'pipeline_ref','pipeline_json_path'}, ''), ...
+        localGetText(payload, {'pipeline_ref','pipeline_bundle_uri'}, ''), ...
+        localGetText(payload, {'pipeline_ref','export_manifest_uri'}, '')};
+    try
+        candidates{end+1} = ctx.pipelineRef.path; %#ok<AGROW>
+    catch
+    end
+    for i = 1:numel(candidates)
+        p = localTranslatePathForWorker(candidates{i}, payload);
+        if isempty(p)
+            continue;
+        end
+        if exist(p, 'file') == 2
+            p = fileparts(p);
+        end
+        if exist(p, 'dir') == 7
+            bases{end+1} = p; %#ok<AGROW>
+            if strcmpi(localPathLeaf(p), 'pipeline')
+                bases{end+1} = fileparts(p); %#ok<AGROW>
+            end
+        end
+    end
+    bases = unique(bases, 'stable');
+end
+
+function snapPath = localClassifierSnapshotPath(modulePath, moduleId)
+    snapPath = '';
+    modulePath = char(string(modulePath));
+    moduleId = char(string(moduleId));
+    if isempty(moduleId)
+        moduleId = localPathLeaf(modulePath);
+    end
+    candidates = {};
+    if ~isempty(moduleId)
+        candidates{end+1} = fullfile(modulePath, [moduleId '_classification.mat']); %#ok<AGROW>
+    end
+    d = dir(fullfile(modulePath, '*_classification.mat'));
+    for i = 1:numel(d)
+        candidates{end+1} = fullfile(d(i).folder, d(i).name); %#ok<AGROW>
+    end
+    for i = 1:numel(candidates)
+        if exist(candidates{i}, 'file') == 2
+            snapPath = candidates{i};
+            return;
+        end
+    end
+end
+
+function idx = localDefaultClassifierRoiSelection(classiObj, ctx)
+    idx = [];
+    intent = '';
+    try
+        intent = lower(strtrim(char(string(ctx.run.classifierIntent))));
+    catch
+    end
+    try
+        if isstruct(classiObj.dataset) && isfield(classiObj.dataset, 'split') && isstruct(classiObj.dataset.split)
+            split = classiObj.dataset.split;
+            if strcmp(intent, 'train') && isfield(split, 'train')
+                idx = localNormalizeSelectionVector(split.train);
+            elseif isfield(split, 'test')
+                idx = localNormalizeSelectionVector(split.test);
+            elseif isfield(split, 'val')
+                idx = localNormalizeSelectionVector(split.val);
+            end
+        end
+    catch
+        idx = [];
+    end
+    if isempty(idx)
+        idx = 1:numel(classiObj.roi);
+    end
+end
+
+function tf = localIsAbsolutePath(pathText)
+    pathText = char(string(pathText));
+    tf = startsWith(pathText, '/') || startsWith(pathText, '\') || ...
+        ~isempty(regexp(pathText, '^[A-Za-z]:[\\/]', 'once'));
+end
+
 function ctx = localBuildExecutionContext(payload, shallowObj, pipeObj)
     ctx = struct();
-    ctx.shallow = shallowObj;
-    ctx.shallowObj = shallowObj;
+    if nargin >= 2 && ~isempty(shallowObj)
+        ctx.shallow = shallowObj;
+        ctx.shallowObj = shallowObj;
+    end
     ctx.allowGUI = false;
     ctx.interactive = false;
     ctx.pipelineRef = struct('id', char(string(pipeObj.strid)), 'path', char(string(pipeObj.path)), 'version', char(string(pipeObj.version)));
-    ctx.targetRef = struct( ...
-        'type', 'shallow', ...
-        'projectPath', fullfile(shallowObj.io.path, shallowObj.io.file), ...
-        'projectName', shallowObj.io.file, ...
-        'fovIds', [], ...
-        'roiIds', {{}}, ...
-        'classiPath', '', ...
-        'notes', '');
+    if nargin >= 2 && ~isempty(shallowObj)
+        ctx.targetRef = struct( ...
+            'type', 'shallow', ...
+            'projectPath', fullfile(shallowObj.io.path, shallowObj.io.file), ...
+            'projectName', shallowObj.io.file, ...
+            'fovIds', [], ...
+            'roiIds', {{}}, ...
+            'classiPath', '', ...
+            'notes', '');
+    else
+        classiPath = localClassifierPathFromPayload(payload);
+        ctx.targetRef = struct( ...
+            'type', 'classi', ...
+            'projectPath', '', ...
+            'projectName', '', ...
+            'fovIds', [], ...
+            'roiIds', {{}}, ...
+            'classiPath', classiPath, ...
+            'notes', 'Classifier-scoped Hub pipeline run.');
+    end
 
     if isfield(payload, 'run_request') && isstruct(payload.run_request)
         rr = payload.run_request;
         ctx.run = struct();
         ctx.run.selectedNodes = localNormalizeSelectedNodes(localGetField(rr, 'selected_nodes', {}));
         ctx.run.nodeParams = localNormalizeNodeParams(localGetField(rr, 'node_params', struct('id', {}, 'params', {})), payload);
+        intent = localNormalizeRunIntent(localGetText(rr, {'intent'}, localGetText(rr, {'classifier_intent'}, '')));
+        if isempty(intent)
+            intent = localInferRunIntentFromNodeParams(ctx.run.nodeParams);
+        end
+        if isempty(intent)
+            intent = localInferRunIntentFromPipeline(pipeObj);
+        end
+        if ~isempty(intent)
+            ctx.run.intent = intent;
+            ctx.run.classifierIntent = intent;
+        end
         ctx.run.runPolicy = localGetText(rr, {'run_policy'}, 'resume');
         inputSource = localGetText(rr, {'input_source'}, localGetText(rr, {'inputSource'}, ''));
         if isfield(rr, 'paths') && isstruct(rr.paths)
@@ -445,6 +748,64 @@ function ctx = localBuildExecutionContext(payload, shallowObj, pipeObj)
     end
 end
 
+function intent = localNormalizeRunIntent(value)
+    intent = '';
+    txt = lower(strtrim(char(string(value))));
+    switch txt
+        case {'train','training','fit'}
+            intent = 'train';
+        case {'validate','validation','val','test','evaluate','eval'}
+            intent = 'validate';
+        case {'infer','inference','classify','classification','predict','prediction'}
+            intent = 'infer';
+    end
+end
+
+function intent = localInferRunIntentFromNodeParams(nodeParams)
+    intent = '';
+    if isempty(nodeParams) || ~isstruct(nodeParams)
+        return;
+    end
+    for i = 1:numel(nodeParams)
+        params = localGetField(nodeParams(i), 'params', struct());
+        cand = '';
+        if isstruct(params)
+            cand = localNormalizeRunIntent(localGetText(params, {'operation'}, localGetText(params, {'intent'}, '')));
+        end
+        if strcmp(cand, 'train')
+            intent = cand;
+            return;
+        elseif isempty(intent) && ~isempty(cand)
+            intent = cand;
+        end
+    end
+end
+
+function intent = localInferRunIntentFromPipeline(pipeObj)
+    intent = '';
+    try
+        nodes = pipeObj.nodes;
+    catch
+        nodes = [];
+    end
+    if isempty(nodes)
+        return;
+    end
+    for i = 1:numel(nodes)
+        params = localGetField(nodes(i), 'params', struct());
+        cand = '';
+        if isstruct(params)
+            cand = localNormalizeRunIntent(localGetText(params, {'operation'}, localGetText(params, {'intent'}, '')));
+        end
+        if strcmp(cand, 'train')
+            intent = cand;
+            return;
+        elseif isempty(intent) && ~isempty(cand)
+            intent = cand;
+        end
+    end
+end
+
 function localValidateInputSourceForSelectedNodes(inputSource, pipeObj, selectedNodes)
     if isempty(selectedNodes) || ~localIsRawInputSource(inputSource)
         return;
@@ -488,6 +849,10 @@ function nodeTypes = localSelectedNodeTypes(pipeObj, selectedNodes)
 end
 
 function runObj = localEnsureRunObject(shallowObj, pipeObj, ctx, payload, runId)
+    if isempty(shallowObj) || ~isa(shallowObj, 'shallow')
+        runObj = localEnsureClassifierScopedRunObject(pipeObj, ctx, payload, runId);
+        return;
+    end
     existingIdx = [];
     try
         if isfield(shallowObj.processing, 'pipelineRun') && ~isempty(shallowObj.processing.pipelineRun)
@@ -516,6 +881,41 @@ function runObj = localEnsureRunObject(shallowObj, pipeObj, ctx, payload, runId)
     end
 end
 
+function runObj = localEnsureClassifierScopedRunObject(pipeObj, ctx, payload, runId)
+    runRoot = localGetText(payload, {'run_request','paths','server_run_path'}, '');
+    if isempty(runRoot)
+        runRoot = localTranslatePathForWorker(localGetText(payload, {'run_request','paths','run_path'}, ''), payload);
+    end
+    if isempty(runRoot)
+        classiPath = localClassifierPathFromPayload(payload);
+        if isempty(classiPath)
+            try
+                classiPath = ctx.targetRef.classiPath;
+            catch
+                classiPath = '';
+            end
+        end
+        if isempty(classiPath)
+            error('detecdiv_run_pipeline_job:ClassifierRunNoPath', ...
+                'Classifier-scoped run requires a classifier path or server_run_path.');
+        end
+        runRoot = fullfile(classiPath, 'pipeline_runs', runId);
+    end
+    if exist(runRoot, 'dir') ~= 7
+        mkdir(runRoot);
+    end
+    runObj = pipelineRun('', runId, 1);
+    runObj.path = runRoot;
+    runObj.templateId = char(string(pipeObj.strid));
+    runObj.templatePath = localCanonicalPipelineJsonPath(pipeObj, pipeObj.path);
+    runObj.pipelineRef = ctx.pipelineRef;
+    runObj.targetRef = ctx.targetRef;
+    runObj.projectPath = '';
+    runObj.projectName = '';
+    runObj.description = localGetText(payload, {'run_request','description'}, 'Classifier-scoped pipeline run.');
+    runObj.ctx = ctx;
+end
+
 function runId = localSuggestRunId(shallowObj, templateId)
     runId = [char(string(templateId)) '_run_1'];
     try
@@ -532,9 +932,16 @@ function runId = localSuggestRunId(shallowObj, templateId)
     end
 end
 
+function runId = localSuggestClassifierScopedRunId(templateId)
+    runId = [char(string(templateId)) '_run_' char(datetime('now','Format','yyyyMMdd_HHmmss'))];
+end
+
 function [ok, msg] = localMaybeSaveProject(shallowObj, payload)
     ok = true;
     msg = '';
+    if isempty(shallowObj) || ~isa(shallowObj, 'shallow')
+        return;
+    end
     saveProject = true;
     saveMode = 'shallowObj';
     try
@@ -904,25 +1311,91 @@ function localWriteResultIfRequested(resultPath, result)
 end
 
 function localAddRepoPaths(repoRoot)
-    persistent done;
-    if ~isempty(done) && done
+    persistent doneRoot;
+    repoRoot = char(string(repoRoot));
+    if ~isempty(doneRoot) && strcmpi(doneRoot, repoRoot)
         return;
     end
-    rawPaths = regexp(genpath(repoRoot), pathsep, 'split');
-    keep = {};
-    for i = 1:numel(rawPaths)
-        p = rawPaths{i};
-        if isempty(p)
-            continue;
+
+    restoredefaultpath();
+    rehash toolboxcache;
+    addpath(repoRoot, '-begin');
+
+    setupFun = fullfile(repoRoot, 'detecdiv_setup_path.m');
+    if exist(setupFun, 'file') == 2
+        detecdiv_setup_path(repoRoot, 'ResetPath', true, 'Verbose', true);
+    else
+        runtimeDirs = {repoRoot, fullfile(repoRoot, 'structure'), ...
+            fullfile(repoRoot, 'helpers'), fullfile(repoRoot, 'engine')};
+        keep = {};
+        for i = 1:numel(runtimeDirs)
+            if exist(runtimeDirs{i}, 'dir') ~= 7
+                continue;
+            end
+            rawPaths = regexp(genpath(runtimeDirs{i}), pathsep, 'split');
+            for j = 1:numel(rawPaths)
+                p = rawPaths{j};
+                if isempty(p) || exist(p, 'dir') ~= 7 || localIsForbiddenRuntimePath(p)
+                    continue;
+                end
+                keep{end+1} = p; %#ok<AGROW>
+            end
         end
-        normp = lower(strrep(p, '/', '\'));
-        if contains(normp, [filesep '.git']) || contains(normp, [filesep 'backups']) || contains(normp, [filesep 'doc'])
-            continue;
+        if ~isempty(keep)
+            addpath(keep{:}, '-begin');
         end
-        keep{end+1} = p; %#ok<AGROW>
     end
-    if ~isempty(keep)
-        addpath(keep{:}, '-begin');
+
+    rehash;
+    localAssertFunctionFromRepo('runPipelineStructured', repoRoot, true);
+    localAssertFunctionFromRepo('pipelineRunSave', repoRoot, true);
+    if exist(fullfile(repoRoot, 'engine', 'classification', '+sam31', 'train.m'), 'file') == 2
+        localAssertFunctionFromRepo('sam31.train', repoRoot, true);
     end
-    done = true;
+    fprintf('[detecdiv_run_pipeline_job] repoRoot: %s\n', repoRoot);
+    fprintf('[detecdiv_run_pipeline_job] runPipelineStructured: %s\n', which('runPipelineStructured'));
+    fprintf('[detecdiv_run_pipeline_job] sam31.train: %s\n', which('sam31.train'));
+    doneRoot = repoRoot;
+end
+
+function tf = localIsForbiddenRuntimePath(pathStr)
+    p = lower(strrep(char(string(pathStr)), '/', filesep));
+    parts = regexp(p, ['\' filesep '+'], 'split');
+    forbidden = {'.git', '.github', '.vs', '.idea', '.codex_transfer_tmp', ...
+        '.codex_deploy_backup', 'backups', 'detecdiv_deploy_backups', ...
+        'doc', 'catalog', '__pycache__'};
+    tf = any(ismember(parts, forbidden));
+end
+
+function localAssertFunctionFromRepo(funName, repoRoot, required)
+    resolved = which(funName);
+    if isempty(resolved)
+        if required
+            error('detecdiv_run_pipeline_job:RuntimeFunctionMissing', ...
+                'Required runtime function is not on the MATLAB path: %s', funName);
+        end
+        return;
+    end
+    resolvedNorm = localNormalizePathForRuntime(resolved);
+    repoNorm = localNormalizePathForRuntime(repoRoot);
+    if ~startsWith(resolvedNorm, [repoNorm '/']) && ~strcmp(resolvedNorm, repoNorm)
+        error('detecdiv_run_pipeline_job:RuntimeFunctionOutsideRepo', ...
+            'Runtime function %s resolves outside repo root.%sResolved: %s%sRepo: %s', ...
+            funName, newline, resolved, newline, repoRoot);
+    end
+    if localIsForbiddenRuntimePath(resolved)
+        error('detecdiv_run_pipeline_job:RuntimeFunctionFromForbiddenPath', ...
+            'Runtime function %s resolves from a forbidden backup/cache path: %s', ...
+            funName, resolved);
+    end
+end
+
+function out = localNormalizePathForRuntime(pathStr)
+    out = char(string(pathStr));
+    out = strrep(out, '\', '/');
+    out = regexprep(out, '/+', '/');
+    if numel(out) > 1 && endsWith(out, '/')
+        out = extractBefore(out, strlength(out));
+    end
+    out = lower(out);
 end

@@ -1057,12 +1057,18 @@ end
                             tmpClassi.trainingFun = [pkgName '.train'];
                         end
 
-                        if strcmpi(pkgName,'cellposesam')
-                            tmpClassi.category = {'Pixel'};
-                        elseif strcmpi(pkgName,'cnn_lstm')
-                            tmpClassi.category = {'LSTM'};
-                        else
-                            tmpClassi.category = {'Image'};
+                        tmpClassi.category = {'Image'};
+                        try
+                            spec = feval([pkgName '.executionSpec'], tmpClassi);
+                            if isstruct(spec) && isfield(spec,'category') && ~isempty(spec.category)
+                                tmpClassi.category = classiNormalizeCategory(spec.category);
+                            elseif strcmpi(pkgName,'cnn_lstm')
+                                tmpClassi.category = {'LSTM'};
+                            end
+                        catch
+                            if strcmpi(pkgName,'cnn_lstm')
+                                tmpClassi.category = {'LSTM'};
+                            end
                         end
                     else
                         tmpClassi.category = {'Image'};
@@ -1271,10 +1277,17 @@ end
                     shallowObj.processing.pipelineRun(runIdx) = runObj;
                     assignin('base', projVar, shallowObj);
                     pipelineRunSave(runObj);
+                    reloadMsg = '';
+                    if any(strcmp(char(string(job.status)), {'done','failed','cancelled'}))
+                        [~, reloadMsg] = localReloadProjectFromDiskAfterHubTerminalStatus(projVar, shallowObj, runObj, runIdx);
+                    end
                     if showDialog
                         msg = sprintf('Hub job: %s\nStatus: %s', char(string(job.id)), char(string(job.status)));
                         if any(strcmp(char(string(job.status)), {'done','failed','cancelled'}))
-                            msg = sprintf('%s\n\nProject changed on hub/server. Reload before local editing.', msg);
+                            if isempty(reloadMsg)
+                                reloadMsg = 'Project changed on hub/server.';
+                            end
+                            msg = sprintf('%s\n\n%s', msg, reloadMsg);
                         end
                         uialert(app.DetecDivUIFigure, msg, 'Hub status', 'Icon', 'info');
                     end
@@ -1320,6 +1333,69 @@ end
                         end
                     end
                 catch
+                end
+            end
+
+            function [ok, msg] = localReloadProjectFromDiskAfterHubTerminalStatus(projVar, shallowObj, runObj, runIdx)
+                ok = false;
+                msg = '';
+                projectMatPath = localProjectMatPath(shallowObj);
+                if isempty(projectMatPath) || exist(projectMatPath, 'file') ~= 2
+                    msg = 'Project changed on hub/server. Reload before local editing.';
+                    return;
+                end
+                try
+                    S = load(projectMatPath, 'shallowObj');
+                    if ~isfield(S, 'shallowObj') || ~isa(S.shallowObj, 'shallow')
+                        msg = 'Project changed on hub/server, but automatic reload failed.';
+                        return;
+                    end
+                    reloadedObj = S.shallowObj;
+                    try
+                        [pathstr, namestr] = fileparts(projectMatPath);
+                        if isunix || ismac
+                            reloadedObj.setPath([pathstr '/'], namestr);
+                        else
+                            reloadedObj.setPath([pathstr '\'], namestr);
+                        end
+                    catch
+                    end
+                    try
+                        if isfield(reloadedObj.processing, 'pipelineRun') ...
+                                && runIdx >= 1 && runIdx <= numel(reloadedObj.processing.pipelineRun)
+                            reloadedObj.processing.pipelineRun(runIdx) = runObj;
+                        end
+                    catch
+                    end
+                    assignin('base', projVar, reloadedObj);
+                    try
+                        app.autoLoadPipelinesForProjectRuns(reloadedObj);
+                    catch
+                    end
+                    try
+                        gatherVarsFromWorkspace(app);
+                        displayNodes(app);
+                    catch
+                    end
+                    ok = true;
+                    msg = 'Project reloaded from disk; local FOV/ROI tree has been refreshed.';
+                catch
+                    msg = 'Project changed on hub/server, but automatic reload failed. Reload before local editing.';
+                end
+            end
+
+            function projectMatPath = localProjectMatPath(projectObj)
+                projectMatPath = '';
+                try
+                    if isempty(projectObj) || ~isa(projectObj, 'shallow')
+                        return;
+                    end
+                    if isempty(projectObj.io.path) || isempty(projectObj.io.file)
+                        return;
+                    end
+                    projectMatPath = fullfile(char(string(projectObj.io.path)), [char(string(projectObj.io.file)) '.mat']);
+                catch
+                    projectMatPath = '';
                 end
             end
 
@@ -2026,6 +2102,13 @@ end
                     end
 
                     tmprun={};
+                    [tmp, runsLoadedFromDisk] = app.ensureProjectPipelineRunsLoaded(tmp);
+                    if runsLoadedFromDisk
+                        try
+                            assignin('base', varlist{i}, tmp);
+                        catch
+                        end
+                    end
                     if isfield(tmp.processing,'pipelineRun') && ~isempty(tmp.processing.pipelineRun)
                         for k=1:numel(tmp.processing.pipelineRun)
                             runObj = tmp.processing.pipelineRun(k);
@@ -2159,6 +2242,87 @@ end
             app.Data=st;
 
             %  st
+        end
+
+        function [shallowObj, loaded] = ensureProjectPipelineRunsLoaded(app, shallowObj)
+            loaded = false;
+            if isempty(shallowObj) || ~isa(shallowObj, 'shallow')
+                return;
+            end
+
+            hasRuns = false;
+            try
+                hasRuns = isfield(shallowObj.processing, 'pipelineRun') && ~isempty(shallowObj.processing.pipelineRun);
+            catch
+                hasRuns = false;
+            end
+            if hasRuns
+                return;
+            end
+
+            projectRoot = '';
+            try
+                projectRoot = fullfile(char(string(shallowObj.io.path)), char(string(shallowObj.io.file)));
+            catch
+                projectRoot = '';
+            end
+            if isempty(projectRoot)
+                return;
+            end
+
+            pipelineRoot = fullfile(projectRoot, 'pipeline');
+            if exist(pipelineRoot, 'dir') ~= 7
+                return;
+            end
+
+            listpipe = dir(pipelineRoot);
+            listpipe = listpipe(arrayfun(@(x)x.isdir, listpipe));
+            listpipe = listpipe(~ismember({listpipe.name}, {'.','..'}));
+            if isempty(listpipe)
+                return;
+            end
+
+            order = zeros(1, numel(listpipe));
+            for j = 1:numel(listpipe)
+                suffix = regexp(listpipe(j).name, '\d+$', 'match');
+                if ~isempty(suffix)
+                    order(j) = str2double(suffix{1});
+                else
+                    order(j) = j;
+                end
+            end
+            [~, ix] = sort(order);
+            listpipe = listpipe(ix);
+
+            pipeList = pipelineRun.empty;
+            for j = 1:numel(listpipe)
+                runPath = fullfile(pipelineRoot, listpipe(j).name);
+                try
+                    [runObj, msg] = pipelineRunLoad(runPath);
+                    if isempty(runObj)
+                        if ~isempty(msg)
+                            runJson = fullfile(runPath, 'run.json');
+                            isPendingRunWrite = contains(char(string(msg)), 'Pipeline run JSON not found') && exist(runJson, 'file') ~= 2;
+                            if ~isPendingRunWrite
+                                warning('detecdiv:PipelineRunLoadFailed', 'pipelineRunLoad failed for %s: %s', runPath, msg);
+                            end
+                        end
+                        continue;
+                    end
+                    pipeList(end+1) = runObj; %#ok<AGROW>
+                catch ME
+                    warning('detecdiv:PipelineRunLoadError', 'pipelineRunLoad error for %s: %s', runPath, ME.message);
+                end
+            end
+
+            if isempty(pipeList)
+                return;
+            end
+            if ~isfield(shallowObj.processing, 'pipelineRun')
+                shallowObj.processing.pipelineRun = pipelineRun.empty;
+            end
+            shallowObj.processing.pipelineRun = pipeList;
+            loaded = true;
         end
 
 
@@ -2324,12 +2488,18 @@ end
                         tmpClassi.trainingFun = [pkgName '.train'];
                     end
 
-                    if strcmpi(pkgName,'cellposesam')
-                        tmpClassi.category = {'Pixel'};
-                    elseif strcmpi(pkgName,'cnn_lstm')
-                        tmpClassi.category = {'LSTM'};
-                    else
-                        tmpClassi.category = {'Image'};
+                    tmpClassi.category = {'Image'};
+                    try
+                        spec = feval([pkgName '.executionSpec'], tmpClassi);
+                        if isstruct(spec) && isfield(spec,'category') && ~isempty(spec.category)
+                            tmpClassi.category = classiNormalizeCategory(spec.category);
+                        elseif strcmpi(pkgName,'cnn_lstm')
+                            tmpClassi.category = {'LSTM'};
+                        end
+                    catch
+                        if strcmpi(pkgName,'cnn_lstm')
+                            tmpClassi.category = {'LSTM'};
+                        end
                     end
                 else
                     tmpClassi.category = {'Image'};
@@ -4542,7 +4712,7 @@ function openRecentProjectCallback(app, projectPath)
     d.Value = 0.66;
     pause(0.2);
 
-    name = proj.io.file;
+    name = makeSafeVariableName(proj.io.file);
     assignin('base', name, proj);
 
     % Auto-load pipeline templates referenced by existing project runs
@@ -4900,12 +5070,18 @@ end
                         tmpClassi.trainingFun = [pkgName '.train'];
                     end
 
-                    if strcmpi(pkgName,'cellposesam')
-                        tmpClassi.category = {'Pixel'};
-                    elseif strcmpi(pkgName,'cnn_lstm')
-                        tmpClassi.category = {'LSTM'};
-                    else
-                        tmpClassi.category = {'Image'};
+                    tmpClassi.category = {'Image'};
+                    try
+                        spec = feval([pkgName '.executionSpec'], tmpClassi);
+                        if isstruct(spec) && isfield(spec,'category') && ~isempty(spec.category)
+                            tmpClassi.category = classiNormalizeCategory(spec.category);
+                        elseif strcmpi(pkgName,'cnn_lstm')
+                            tmpClassi.category = {'LSTM'};
+                        end
+                    catch
+                        if strcmpi(pkgName,'cnn_lstm')
+                            tmpClassi.category = {'LSTM'};
+                        end
                     end
                 else
                     tmpClassi.category = {'Image'};
@@ -4977,8 +5153,177 @@ end
             if isempty(app) || ~isvalid(app) || isempty(app.DetecDivUIFigure) || ~isvalid(app.DetecDivUIFigure)
                 return;
             end
+            app.syncProjectFromWorkspaceEvent(payload);
+            try
+                gatherVarsFromWorkspace(app);
+                displayNodes(app);
+            catch
+            end
             RefreshtreewindowMenuSelected(app, []);
             drawnow limitrate;
+        end
+
+        function syncProjectFromWorkspaceEvent(app, payload) %#ok<INUSD>
+            if nargin < 2 || ~isstruct(payload)
+                return;
+            end
+
+            projectObj = [];
+            if isfield(payload, 'projectObj') && isa(payload.projectObj, 'shallow')
+                projectObj = payload.projectObj;
+            elseif isfield(payload, 'shallowObj') && isa(payload.shallowObj, 'shallow')
+                projectObj = payload.shallowObj;
+            elseif isfield(payload, 'shallow') && isa(payload.shallow, 'shallow')
+                projectObj = payload.shallow;
+            end
+
+            projectMatPath = '';
+            if isfield(payload, 'projectMatPath') && ~isempty(payload.projectMatPath)
+                projectMatPath = char(string(payload.projectMatPath));
+            elseif isfield(payload, 'projectPath') && ~isempty(payload.projectPath)
+                projectMatPath = app.projectMatPathFromEventPath(payload.projectPath);
+            end
+
+            if isempty(projectObj) && ~isempty(projectMatPath) && exist(projectMatPath, 'file') == 2
+                try
+                    S = load(projectMatPath, 'shallowObj');
+                    if isfield(S, 'shallowObj') && isa(S.shallowObj, 'shallow')
+                        projectObj = S.shallowObj;
+                        try
+                            [pathstr, namestr] = fileparts(projectMatPath);
+                            if isunix || ismac
+                                projectObj.setPath([pathstr '/'], namestr);
+                            else
+                                projectObj.setPath([pathstr '\'], namestr);
+                            end
+                        catch
+                        end
+                    end
+                catch ME
+                    warning('detecdiv:WorkspaceEventLoadFailed', ...
+                        'Unable to load project from event path "%s": %s', projectMatPath, ME.message);
+                end
+            end
+
+            if isempty(projectObj) || ~isa(projectObj, 'shallow')
+                return;
+            end
+
+            varName = app.projectWorkspaceVarNameFromEvent(payload, projectObj);
+            if isempty(varName)
+                return;
+            end
+
+            try
+                assignin('base', varName, projectObj);
+            catch ME
+                warning('detecdiv:WorkspaceEventAssignFailed', ...
+                    'Unable to publish project "%s" to base workspace: %s', varName, ME.message);
+            end
+        end
+
+        function matPath = projectMatPathFromEventPath(app, projectPath) %#ok<INUSD>
+            matPath = '';
+            if isempty(projectPath)
+                return;
+            end
+            p = char(string(projectPath));
+            if exist(p, 'file') == 2
+                matPath = p;
+                return;
+            end
+            if exist([p '.mat'], 'file') == 2
+                matPath = [p '.mat'];
+                return;
+            end
+            if exist(p, 'dir') == 7
+                [parentDir, projectName] = fileparts(p);
+                candidate = fullfile(parentDir, [projectName '.mat']);
+                if exist(candidate, 'file') == 2
+                    matPath = candidate;
+                end
+            end
+        end
+
+        function varName = projectWorkspaceVarNameFromEvent(app, payload, projectObj) %#ok<INUSD>
+            varName = '';
+            if isfield(payload, 'projectVarName') && ~isempty(payload.projectVarName)
+                varName = char(string(payload.projectVarName));
+            end
+            if isempty(varName) && isfield(payload, 'workspaceVar') && ~isempty(payload.workspaceVar)
+                varName = char(string(payload.workspaceVar));
+            end
+            if isempty(varName)
+                varName = app.findExistingProjectWorkspaceVar(projectObj);
+            end
+            if isempty(varName)
+                try
+                    varName = char(string(projectObj.id));
+                catch
+                    varName = '';
+                end
+            end
+            if isempty(varName)
+                try
+                    [~, file] = projectObj.getPath;
+                    varName = char(string(file));
+                catch
+                    varName = '';
+                end
+            end
+            varName = matlab.lang.makeValidName(varName);
+            if isempty(varName)
+                varName = 'shallowObj';
+            end
+        end
+
+        function varName = findExistingProjectWorkspaceVar(app, projectObj) %#ok<INUSD>
+            varName = '';
+            if isempty(projectObj) || ~isa(projectObj, 'shallow')
+                return;
+            end
+            targetPath = '';
+            targetFile = '';
+            try
+                [targetPath, targetFile] = projectObj.getPath;
+            catch
+            end
+            targetId = '';
+            try
+                targetId = char(string(projectObj.id));
+            catch
+            end
+
+            try
+                vars = evalin('base', 'who');
+            catch
+                vars = {};
+            end
+            for iVar = 1:numel(vars)
+                try
+                    candidate = evalin('base', vars{iVar});
+                catch
+                    continue;
+                end
+                if ~isa(candidate, 'shallow')
+                    continue;
+                end
+                try
+                    [candidatePath, candidateFile] = candidate.getPath;
+                    if ~isempty(targetPath) && strcmp(candidatePath, targetPath) && strcmp(candidateFile, targetFile)
+                        varName = vars{iVar};
+                        return;
+                    end
+                catch
+                end
+                try
+                    if ~isempty(targetId) && strcmp(char(string(candidate.id)), targetId)
+                        varName = vars{iVar};
+                        return;
+                    end
+                catch
+                end
+            end
         end
 
         function applyMainWindowLayout(app)
@@ -5213,9 +5558,9 @@ end
                 app.AdddataButton.Visible='on';
                 app.AdddataButton.Text='Open workflow...';
                 app.AdddataButton.Tooltip={'Open the workflow frontend for data loading, ROI definition and ROI extraction'};
-                app.AddclassifierButton.Visible='on';
+                app.AddclassifierButton.Visible='off';
                 %                app.CheckrawdatapathButton.Visible='on';
-                app.UpdaterawdatapathButton.Visible='on';
+                app.UpdaterawdatapathButton.Visible='off';
                 app.IdentifyROIsinpositionsButton.Visible='off';
                 app.ExtractROIhypervolumesButton.Visible='off';
 
@@ -5323,15 +5668,34 @@ end
                 if numel(app.Tree.SelectedNodes.Children)==0
                     if numel(app.Data.Projectclassirois{cc(1)})
                         [pth fle ext]= fileparts(which('detecdiv.mlapp'));
-                        for n=1:numel(app.Data.Projectclassirois{cc(1)}{cc(2)})
+                        roiLabels = app.Data.Projectclassirois{cc(1)}{cc(2)};
+                        nRoi = numel(roiLabels);
+                        roiProgressDialog = [];
+                        roiProgressCleanup = [];
+                        if nRoi >= 25
+                            roiProgressDialog = uiprogressdlg(app.DetecDivUIFigure, ...
+                                'Title', 'Please Wait...', ...
+                                'Message', 'Generating classifier ROI list...', ...
+                                'Value', 0);
+                            roiProgressCleanup = onCleanup(@() app.safeCloseProgressDialog(roiProgressDialog)); %#ok<NASGU>
+                            drawnow limitrate;
+                        end
+                        for n=1:nRoi
+                            if ~isempty(roiProgressDialog) && isvalid(roiProgressDialog) && ...
+                                    (n == 1 || n == nRoi || mod(n, 10) == 0)
+                                roiProgressDialog.Value = n ./ nRoi;
+                                roiProgressDialog.Message = ['Generating classifier ROI list... ' num2str(n) '/' num2str(nRoi)];
+                                drawnow limitrate;
+                            end
                             % aa=app.Data.Projectclassirois{i}{k}{n}
                             cm=uicontextmenu(app.DetecDivUIFigure);
                             m = uimenu(cm,'Text','Open ROI...');
                             m.MenuSelectedFcn={@contextMenuROIFcn,[cc(1),cc(2),n],'Projectclassirois'};
                             %  ''ContextMenu',cm'
-                            uitreenode(app.Tree.SelectedNodes,'Text',app.Data.Projectclassirois{cc(1)}{cc(2)}{n},'Tag','Projectclassirois','UserData',[cc(1),cc(2),n],'Icon',fullfile(pth,'roi.png'));
+                            uitreenode(app.Tree.SelectedNodes,'Text',roiLabels{n},'Tag','Projectclassirois','UserData',[cc(1),cc(2),n],'Icon',fullfile(pth,'roi.png'));
                             % disabled because too heavy with large projects
                         end
+                        clear roiProgressCleanup
                     end
                 end
 
@@ -5451,20 +5815,38 @@ end
                 clas=evalin('base',proj);
 
 
-                if numel(app.Tree.SelectedNodes.Children)==0
+                if isempty(app.Tree.SelectedNodes.Children) || ~any(arrayfun(@(child) strcmp(child.Tag,'Classifierrois'), app.Tree.SelectedNodes.Children))
                     if numel(app.Data.Classifierrois{cc})
-
-                        for n=1:numel(app.Data.Classifierrois{cc})
+                        roiLabels = app.Data.Classifierrois{cc};
+                        nRoi = numel(roiLabels);
+                        roiProgressDialog = [];
+                        roiProgressCleanup = [];
+                        if nRoi >= 25
+                            roiProgressDialog = uiprogressdlg(app.DetecDivUIFigure, ...
+                                'Title', 'Please Wait...', ...
+                                'Message', 'Generating classifier ROI list...', ...
+                                'Value', 0);
+                            roiProgressCleanup = onCleanup(@() app.safeCloseProgressDialog(roiProgressDialog)); %#ok<NASGU>
+                            drawnow limitrate;
+                        end
+                        for n=1:nRoi
+                            if ~isempty(roiProgressDialog) && isvalid(roiProgressDialog) && ...
+                                    (n == 1 || n == nRoi || mod(n, 10) == 0)
+                                roiProgressDialog.Value = n ./ nRoi;
+                                roiProgressDialog.Message = ['Generating classifier ROI list... ' num2str(n) '/' num2str(nRoi)];
+                                drawnow limitrate;
+                            end
                             % aa=app.Data.Projectclassirois{i}{k}{n}
                             cm=uicontextmenu(app.DetecDivUIFigure);
                             m = uimenu(cm,'Text','Open ROI...');
-                            m.MenuSelectedFcn={@contextMenuROIFcn,[cc,n],'Projectposrois'};
+                            m.MenuSelectedFcn={@contextMenuROIFcn,[cc,n],'Classifierrois'};
                             %  'ContextMenu',cm
                             [pth fle ext]= fileparts(which('detecdiv.mlapp'));
 
-                            uitreenode(app.Tree.SelectedNodes,'Text',app.Data.Classifierrois{cc}{n},'Tag','Classifierrois','UserData',[cc,n],'Icon',fullfile(pth,'roi.png'));
+                            uitreenode(app.Tree.SelectedNodes,'Text',roiLabels{n},'Tag','Classifierrois','UserData',[cc,n],'Icon',fullfile(pth,'roi.png'));
                             % disabled because too heavy with large projects
                         end
+                        clear roiProgressCleanup
                     end
                 end
 
@@ -5785,11 +6167,33 @@ end
                         roiObj.parent=clas;
                 end
 
-                figures=findall(0,'Type','figure');
-                appFigure=findobj(figures,'Name','ScoreApp');
-                if isprop(appFigure,'RunningAppInstance')
-                    appFigure.RunningAppInstance.addROI(roiObj);
-                else
+                openedInExistingScore = false;
+                try
+                    figures=findall(0,'Type','figure');
+                    appFigure=findobj(figures,'Name','ScoreApp');
+                    if ~isempty(appFigure) && isprop(appFigure(1),'RunningAppInstance')
+                        scoreApp = appFigure(1).RunningAppInstance;
+                        if ~isempty(scoreApp) && isvalid(scoreApp)
+                            scoreApp.addROI(roiObj);
+                            try
+                                figure(scoreApp.ScoreAppUIFigure);
+                            catch
+                            end
+                            openedInExistingScore = true;
+                        end
+                    end
+                catch ME
+                    warning('DetecDiv:OpenScore:AddROI', ...
+                        'Could not add ROI to existing Score instance: %s', ME.message);
+                    openedInExistingScore = false;
+                end
+
+                if ~openedInExistingScore
+                    try
+                        clear score
+                        rehash
+                    catch
+                    end
                     score(roiObj);
                 end
 
@@ -5824,7 +6228,7 @@ end
             if numel(proj)==0
                 return;
             end
-            name=proj.io.file;
+            name=makeSafeVariableName(proj.io.file);
             assignin('base',name,proj);
             gatherVarsFromWorkspace(app);
             displayNodes(app)
@@ -5863,7 +6267,7 @@ end
             pause(0.2);  % (garde si tu veux forcer l'update graphique)
 
             % mettre l'objet dans le workspace base sous son nom
-            name = proj.io.file;
+            name = makeSafeVariableName(proj.io.file);
             assignin('base', name, proj);
 
     % Auto-load pipeline templates referenced by existing project runs

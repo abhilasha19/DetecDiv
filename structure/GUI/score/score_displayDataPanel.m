@@ -25,16 +25,32 @@ data = roiobj.data(layoutOptions.dataidx{groupIdx});
 % --- Extraction robuste de ydata.
 % Une variable cellulaire numerique/vectorielle est etendue en une courbe par element.
 [ydata, varname, yTickInfo, sourceIndex] = score_extractYData(data.data, dataIndices);
+if isempty(sourceIndex) || size(ydata, 2) == 0
+    cla(ax);
+    hLine = gobjects(0);
+    ax.UserData.xlim = 'auto';
+    ax.UserData.ylim = 'auto';
+    return;
+end
 
 groupname = layoutOptions.plotidxgroup{groupIdx};
-pix = find(matches(data.groupProperties(:,1), groupname));
-plottype = data.groupProperties{pix,2};
-
+pix = [];
+if isprop(data, 'groupProperties') && ~isempty(data.groupProperties) && size(data.groupProperties, 2) >= 2
+    try
+        pix = find(matches(string(data.groupProperties(:,1)), string(groupname)), 1, 'first');
+    catch
+        pix = [];
+    end
+end
+plottype = "Plot";
 ybounds = []; xbounds = [];
-if numel(pix)
+if ~isempty(pix)
+    plottype = string(data.groupProperties{pix,2});
     ybounds = data.groupProperties{pix,4};
     xbounds = data.groupProperties{pix,3};
 end
+[xBounds, xBoundsAuto] = localParseAxisBounds(xbounds);
+[yBounds, yBoundsAuto] = localParseAxisBounds(ybounds);
 
 % --- Axe X (minutes) ---
 if timeoffset
@@ -46,10 +62,20 @@ else
     xdata = (1:size(ydata,1)) * framerate;
 end
 
+[movieXLim, clipToMovie] = localMovieXLimits(layoutOptions);
+if clipToMovie
+    keepMovie = xdata >= movieXLim(1) & xdata <= movieXLim(2);
+    if any(keepMovie)
+        xdata = xdata(keepMovie);
+        ydata = ydata(keepMovie, :);
+    end
+end
+
 % --- Légendes (noms de colonnes) ---
 str = cell(1, size(ydata,2));
 for i = 1:size(ydata,2)
-    str{i} = varname{i};
+    labelText = localPlotDisplayName(data, sourceIndex(i), varname{i});
+    str{i} = score_wrapDisplayLabel(labelText, 32);
 end
 
 if plottype=="Plot"
@@ -83,7 +109,7 @@ if plottype=="Plot"
     % --- Marqueurs sur frames (corrige timeoffset) ---
     hLine2 = gobjects(0);
     cc = 1;
-    markerSize = 10;
+    markerSize = max(4, floor(0.6 * layoutOptions.fontSize));
 
     for k = 1:length(layoutOptions.frames)
         fIdx = layoutOptions.frames(k);
@@ -96,9 +122,19 @@ if plottype=="Plot"
             fRel = fIdx;
         end
 
-        if fRel >= 1 && fRel <= size(ydata,1)
+        markerIdxInData = [];
+        if clipToMovie
+            [~, markerIdxInData] = min(abs(xdata - xMarker));
+            if isempty(markerIdxInData) || abs(xdata(markerIdxInData) - xMarker) > max(eps, 0.5 * framerate)
+                markerIdxInData = [];
+            end
+        elseif fRel >= 1 && fRel <= size(ydata,1)
+            markerIdxInData = fRel;
+        end
+
+        if ~isempty(markerIdxInData)
             for j = 1:length(hLine)
-                yMarker = ydata(fRel, j);
+                yMarker = ydata(markerIdxInData, j);
                 hLine2(cc) = plot(ax, xMarker, yMarker, 'o', ...
                     'MarkerSize', markerSize, ...
                     'MarkerFaceColor', hLine(j).Color, ...
@@ -113,7 +149,8 @@ if plottype=="Plot"
     hold(ax, 'off');
 
     % --- Labels axes ---
-    ylabel(ax, layoutOptions.plotidxgroup{groupIdx}, ...
+    yLabelText = layoutOptions.plotidxgroup{groupIdx};
+    ylabel(ax, score_wrapDisplayLabel(yLabelText), ...
         'FontSize', floor(layoutOptions.fontSize), ...
         'FontName', 'Arial', 'Color', layoutOptions.textColor, ...
         'Interpreter', 'none');
@@ -147,12 +184,16 @@ if plottype=="Plot"
         end
     end
 
-    if track
+    if clipToMovie
+        amin = movieXLim(1);
+        amax = movieXLim(2);
+        ax.UserData.xlim = [amin amax];
+    elseif track
         amin = xMarker - layoutOptions.trackWindow * framerate;
         amax = xMarker + layoutOptions.trackWindow * framerate;
         ax.UserData.xlim = [amin amax];
     else
-        if isempty(xbounds) || xbounds=="auto"
+        if xBoundsAuto
             amin = min(xdata);
             if amin>0, amin = 0.95*amin-0.01; else, amin = 1.05*amin-0.01; end
 
@@ -161,8 +202,7 @@ if plottype=="Plot"
 
             ax.UserData.xlim = 'auto';
         else
-            xb = str2num(xbounds); %#ok<ST2NM>
-            amin = xb(1); amax = xb(2);
+            amin = xBounds(1); amax = xBounds(2);
             ax.UserData.xlim = [amin amax];
         end
     end
@@ -178,11 +218,10 @@ if plottype=="Plot"
         ax.UserData.ylim = 'labels';
     else
         % --- YLim normal (numérique) ---
-        if isempty(ybounds) || ybounds=="auto" || isnan(str2num(ybounds)) %#ok<ST2NM>
+        if yBoundsAuto
             ax.UserData.ylim = 'auto';
         else
-            yb = str2num(ybounds); %#ok<ST2NM>
-            amin = yb(1); amax = yb(2);
+            amin = yBounds(1); amax = yBounds(2);
             ylim(ax, [amin amax]);
             ax.UserData.ylim = [amin amax];
         end
@@ -207,26 +246,20 @@ if plottype=="Plot"
     end
 
     set(ax, 'box', 'off');
+    score_drawMovieEventLines(ax, layoutOptions);
 
 else
     % ===========================
     % ======= TRAJ MODE =========
     % ===========================
 
-    if timeoffset
-        keep = xdata >= 0;
-        ydata = ydata(keep,:);
-        xdata = xdata(keep);
-    end
-
     % Y bounds
-    if isempty(ybounds) || ybounds=="auto" || isnan(str2num(ybounds)) %#ok<ST2NM>
+    if yBoundsAuto
         ax.UserData.ylim = 'auto';
         amin = min(ydata(:));
         amax = max(ydata(:));
     else
-        yb = str2num(ybounds); %#ok<ST2NM>
-        amin = yb(1); amax = yb(2);
+        amin = yBounds(1); amax = yBounds(2);
         ax.UserData.ylim = [amin amax];
     end
 
@@ -234,13 +267,14 @@ else
 
     [rgbImage, alphaImage, color] = render_ydata_as_image(ydata, amin, amax, layoutOptions, data, sourceIndex);
 
-    hLine = imagesc(ax, rgbImage, 'AlphaData', alphaImage);
+    hLine = imagesc(ax, xdata, 1:size(rgbImage, 1), rgbImage, 'AlphaData', alphaImage);
     axis(ax, 'normal');
 
     set(ax, 'XColor', layoutOptions.textColor, 'YColor', layoutOptions.background, 'Box', 'off');
     set(ax, 'Color', layoutOptions.background, 'FontSize', floor(sqrt(scalingFactor)*layoutOptions.fontSize));
 
-    ylabel(ax, layoutOptions.plotidxgroup{groupIdx}, ...
+    yLabelText = layoutOptions.plotidxgroup{groupIdx};
+    ylabel(ax, score_wrapDisplayLabel(yLabelText), ...
         'FontName', 'Arial', 'Color', layoutOptions.textColor, ...
         'Interpreter', 'none', 'FontSize', floor(sqrt(scalingFactor)*layoutOptions.fontSize));
 
@@ -250,7 +284,11 @@ else
 
     ylim(ax, [-1, size(rgbImage,1) + 1]);
 
-    if isempty(xbounds) || xbounds=="auto"
+    if clipToMovie
+        amin = movieXLim(1);
+        amax = movieXLim(2);
+        ax.UserData.xlim = [amin amax];
+    elseif xBoundsAuto
         amin = min(xdata);
         if amin>0, amin = 0.95*amin-0.01; else, amin = 1.05*amin-0.01; end
 
@@ -259,16 +297,15 @@ else
 
         ax.UserData.xlim = 'auto';
     else
-        xb = str2num(xbounds); %#ok<ST2NM>
-        amin = xb(1); amax = xb(2);
+        amin = xBounds(1); amax = xBounds(2);
         ax.UserData.xlim = [amin amax];
     end
 
-    xlim(ax, [amin amax] / layoutOptions.framerate);
+    xlim(ax, [amin amax]);
 
-    xlims = layoutOptions.framerate * get(ax, 'XLim');
+    xlims = get(ax, 'XLim');
     ticks = niceTicks(xlims(1), xlims(2), 5);
-    set(ax, 'XTick', ticks / layoutOptions.framerate);
+    set(ax, 'XTick', ticks);
 
     if groupIdx < layoutOptions.ngroup
         set(ax, 'XTickLabel', []);
@@ -278,8 +315,8 @@ else
     end
 
     axPos = get(ax, 'Position');
-    W = 0.2;
-    H = 0.3 * size(ydata,2) * (axPos(4)-0.05);
+    W = 0.28;
+    H = min(axPos(4) * 0.85, max(0.08, 0.055 * size(ydata,2)));
 
     panelLeft   = axPos(1) + axPos(3) - W - 0.01;
     panelBottom = axPos(2) + axPos(4) - H;
@@ -287,6 +324,7 @@ else
     if layoutOptions.legend
         addHorizontalColorbarLegend(ax.Parent.Parent, ydata, color, [panelLeft, panelBottom, W, H], layoutOptions, str);
     end
+    score_drawMovieEventLines(ax, layoutOptions);
 
     hold(ax, 'off');
 end
@@ -297,6 +335,78 @@ end
 % =======================
 % ===== Subfunctions =====
 % =======================
+
+function label = localPlotDisplayName(data, sourceIdx, fallback)
+label = fallback;
+try
+    if isprop(data, 'plotProperties') && ~isempty(data.plotProperties) && ...
+            size(data.plotProperties, 2) >= 2 && sourceIdx <= size(data.plotProperties, 1)
+        candidate = data.plotProperties{sourceIdx, 2};
+        if strlength(string(candidate)) > 0
+            label = char(string(candidate));
+        end
+    end
+catch
+    label = fallback;
+end
+end
+
+function [bounds, isAuto] = localParseAxisBounds(rawBounds)
+bounds = [];
+isAuto = true;
+try
+    if isempty(rawBounds)
+        return;
+    end
+
+    if isnumeric(rawBounds)
+        vals = double(rawBounds(:)');
+    else
+        txt = strtrim(char(string(rawBounds)));
+        if isempty(txt) || strcmpi(txt, 'auto')
+            return;
+        end
+        vals = str2num(strrep(txt, ',', ' ')); %#ok<ST2NM>
+    end
+
+    if isnumeric(vals) && numel(vals) >= 2 && all(isfinite(vals(1:2))) && vals(2) > vals(1)
+        bounds = vals(1:2);
+        isAuto = false;
+    end
+catch
+    bounds = [];
+    isAuto = true;
+end
+end
+
+function [xlims, doClip] = localMovieXLimits(layoutOptions)
+xlims = [];
+doClip = false;
+try
+    if ~isfield(layoutOptions, 'mode') || ~strcmpi(string(layoutOptions.mode), "movie") || ...
+            ~isfield(layoutOptions, 'frames') || isempty(layoutOptions.frames) || ...
+            ~isfield(layoutOptions, 'framerate') || isempty(layoutOptions.framerate)
+        return;
+    end
+    frames = double(layoutOptions.frames(:)');
+    framerate = double(layoutOptions.framerate);
+    if ~isfinite(framerate) || framerate <= 0 || isempty(frames)
+        return;
+    end
+    if isfield(layoutOptions, 'timeOffset') && layoutOptions.timeOffset
+        xlims = [0, (max(frames) - min(frames)) * framerate];
+    else
+        xlims = [min(frames), max(frames)] * framerate;
+    end
+    if xlims(2) <= xlims(1)
+        xlims(2) = xlims(1) + framerate;
+    end
+    doClip = all(isfinite(xlims));
+catch
+    xlims = [];
+    doClip = false;
+end
+end
 
 function rgb = parseRGBstring(str)
 rgb = [];
@@ -494,8 +604,9 @@ for i = 1:numSeries
     legendRGB = ind2rgb(indices, currentCmap);
     legendRGB = reshape(legendRGB, [1, nColor, 3]);
 
-    imagesc([minVal, maxVal], [0, 1], legendRGB);
+    imagesc(ax, [minVal, maxVal], [0, 1], legendRGB);
     axis(ax, 'normal');
+    ylim(ax, [-0.7, 1.65]);
 
     posInset = pos;
     marginX = 0.1 * pos(3);
@@ -512,25 +623,32 @@ for i = 1:numSeries
     set(ax, 'XTick', []);
     set(ax, 'YTick', []);
 
-    xLimits = get(ax, 'XLim');
-    yLimits = get(ax, 'YLim');
+    labelText = score_wrapDisplayLabel(varName{i}, 26);
 
-    text(ax, xLimits(1), mean(yLimits), num2str(minVal, '%.1f'), ...
-        'Units', 'data', 'Color', layoutOptions.textColor, ...
-        'FontSize', floor(layoutOptions.fontSize), ...
-        'HorizontalAlignment', 'left', 'VerticalAlignment', 'middle');
+    text(ax, 0.5, 0.98, labelText, ...
+        'Units', 'normalized', ...
+        'Color', layoutOptions.textColor, ...
+        'FontWeight', 'bold', ...
+        'FontSize', max(6, floor(0.85 * layoutOptions.fontSize)), ...
+        'HorizontalAlignment', 'center', ...
+        'VerticalAlignment', 'top', ...
+        'Interpreter', 'none', ...
+        'BackgroundColor', layoutOptions.background, ...
+        'Margin', 1);
 
-    text(ax, xLimits(2)+0.01, mean(yLimits), num2str(maxVal, '%.1f'), ...
-        'Units', 'data', 'Color', layoutOptions.textColor, ...
-        'FontSize', floor(layoutOptions.fontSize), ...
-        'HorizontalAlignment', 'right', 'VerticalAlignment', 'middle');
+    text(ax, 0, 0.05, num2str(minVal, '%.1f'), ...
+        'Units', 'normalized', ...
+        'Color', layoutOptions.textColor, ...
+        'FontSize', max(6, floor(0.8 * layoutOptions.fontSize)), ...
+        'HorizontalAlignment', 'left', ...
+        'VerticalAlignment', 'bottom');
 
-    xCenter = mean(xLimits);
-    yCenter = mean(yLimits);
-    text(ax, xCenter, yCenter, varName{i}, ...
-        'Color', layoutOptions.textColor, 'FontWeight', 'bold', ...
-        'HorizontalAlignment', 'center', 'VerticalAlignment', 'middle', ...
-        'Interpreter', 'none');
+    text(ax, 1, 0.05, num2str(maxVal, '%.1f'), ...
+        'Units', 'normalized', ...
+        'Color', layoutOptions.textColor, ...
+        'FontSize', max(6, floor(0.8 * layoutOptions.fontSize)), ...
+        'HorizontalAlignment', 'right', ...
+        'VerticalAlignment', 'bottom');
 
     axLegend{i} = ax;
 end

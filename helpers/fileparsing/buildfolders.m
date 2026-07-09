@@ -12,6 +12,12 @@ selecteddir=[];
 cc=1;
 dirlist=dirlist([dirlist.isdir]);
 dirlist = dirlist(~ismember({dirlist.name},{'.','..'}));
+dirlist = dirlist(~cellfun(@localIsIgnoredPositionFolder, {dirlist.name}));
+if isempty(dirlist)
+    output.pos = [];
+    output.comments = [output.comments 'No image position folders available after filtering DetecDiv artifacts.' char(10)];
+    return;
+end
 [~, ix] = localSortNaturalStrings({dirlist.name});
 dirlist = dirlist(ix);
 for i=1:numel(dirlist)
@@ -60,6 +66,7 @@ for i=1:numel(output.pos) % extract channels from string names, treat different 
  progress.Message=info;
  progress.Value=min(1,0.67+0.33*(i-1)./numel(output.pos));
  end
+ detecdiv_check_cancel(progress, info);
  
  
  
@@ -253,6 +260,11 @@ for i = 1:numel(parts)
     end
 end
 key = strjoin(buf, '');
+end
+
+function tf = localIsIgnoredPositionFolder(name)
+name = lower(char(string(name)));
+tf = strcmp(name, '.detecdiv-previews') || startsWith(name, '.detecdiv-');
 end
     
 

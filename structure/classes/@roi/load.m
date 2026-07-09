@@ -460,15 +460,19 @@ for i = 1:N
     attrs(i).k         = k;
     attrs(i).intensity = readAttOrDefault(h5File,p,'display_intensity',[1 1 1]);
     attrs(i).rgb       = readAttOrDefault(h5File,p,'display_rgb',      [1 1 1]);
+    attrs(i).colorMode = readAttOrDefault(h5File,p,'display_color_mode','rgb');
+    attrs(i).colormapName = readAttOrDefault(h5File,p,'display_colormap_name','');
     attrs(i).displaylim       = readAttOrDefault(h5File,p,'display_displaylim',      [1 ; 1]);
     attrs(i).indexed   = readAttOrDefault(h5File,p,'display_indexed',  uint8(0));
     attrs(i).alpha     = readAttOrDefault(h5File,p,'display_alpha',    1);
     attrs(i).contour   = readAttOrDefault(h5File,p,'display_contour',  uint8(0));
     attrs(i).width     = readAttOrDefault(h5File,p,'display_contourwidth', 1);
+    attrs(i).log       = readAttOrDefault(h5File,p,'display_log', uint8(0));
     attrs(i).frame     = readAttOrDefault(h5File,p,'display_frame', 1);
     attrs(i).binning   = readAttOrDefault(h5File,p,'display_binning', 1);
     % aa=readAttOrDefault(h5File,p,'display_selectedchannel',1)
     attrs(i).selectedchannel = readAttOrDefault(h5File,p,'display_selectedchannel',1);
+    attrs(i).valueTransform = readValueTransformOrDefault(h5File, p);
 end
 
 % --- Ordonner : d'abord ceux qui ont un premier index connu, puis les autres (stable) ---
@@ -536,8 +540,23 @@ if hasBadIdx
 else
     % Utiliser les indices fournis
     idxList = idxRaw;
-    C = max([idxList{:}]);
-    debugPrintf('[DEBUG] Using provided channel_indices: total C=%d\n', C);
+    allIdx = [idxList{:}];
+    expectedIdx = 1:sum(kList);
+    if isempty(allIdx) || any(~isfinite(double(allIdx))) || any(double(allIdx) < 1) || ...
+            numel(unique(double(allIdx))) ~= numel(allIdx) || ~isequal(sort(double(allIdx)), expectedIdx)
+        idxList = cell(1,N);
+        c0 = 0;
+        for i = 1:N
+            k = kList(i);
+            idxList{i} = (c0+1):(c0+k);
+            c0 = c0 + k;
+        end
+        C = sum(kList);
+        debugPrintf('[DEBUG] Repacked non-compact channel_indices sequentially: total C=%d\n', C);
+    else
+        C = max(allIdx);
+        debugPrintf('[DEBUG] Using provided channel_indices: total C=%d\n', C);
+    end
 end
 
 % --- Allocation & remplissage de l'image globale ---
@@ -606,7 +625,7 @@ end
 
 % --- Trouver le dataset par "channel_name" (attribut) ou par nom
 target = [];
-target_idx = [];
+targetIdx = [];
 for i = 1:numel(dsets)
     p = ['/' dsets(i).Name];
     nm = dsets(i).Name;
@@ -617,7 +636,7 @@ for i = 1:numel(dsets)
     end
     if strcmpi(chn, chanName) || strcmpi(nm, chanName)
         target = dsets(i);
-        target_idx = i; %#ok<NASGU>
+        targetIdx = i;
         break;
     end
 end
@@ -647,24 +666,11 @@ frameList = normalizeH5FrameList(frameAttr, T);
 
 % --- Lire/estimer les indices globaux pour ce canal
 % Essai 1 : utiliser channel_indices s'il existe
-try
-    idxProvided = h5readatt(h5File, pTarget, 'channel_indices'); idxProvided = idxProvided(:).';
-catch
-    idxProvided = [];
-end
+% channel_indices is intentionally ignored for partial loads: score keeps a
+% compact in-memory image and uses channelid for logical-channel mapping.
 
 % Pour connaître le C total et les indices occupés par les autres canaux,
 % on scanne vite fait les attributs des autres datasets (pas besoin des data)
-allIdx = {};
-for i = 1:numel(dsets)
-    p = ['/' dsets(i).Name];
-    try
-        ci = h5readatt(h5File, p, 'channel_indices'); ci = ci(:).';
-    catch
-        ci = [];
-    end
-    allIdx{i} = ci;
-end
 
 % Stratégie d'indexation:
 % - Si idxProvided cohérent -> on s'en sert
@@ -673,8 +679,15 @@ end
 %   mais comme on ne charge qu'un canal, on place au début.
 
 destIdx = [];
-if ~isempty(idxProvided) && numel(idxProvided) == k
-    destIdx = idxProvided;
+logicalIdWanted = targetIdx;
+if isstruct(disp0) && isfield(disp0,'channel') && ~isempty(disp0.channel)
+    logicalNames = disp0.channel;
+    if isstring(logicalNames), logicalNames = cellstr(logicalNames); end
+    if ~iscell(logicalNames), logicalNames = {char(string(logicalNames))}; end
+    hit = find(strcmpi(logicalNames, chanName), 1);
+    if ~isempty(hit)
+        logicalIdWanted = hit;
+    end
 end
 
 % Taille C existante si img0 fourni
@@ -682,19 +695,13 @@ if ~isempty(img0)
     C0 = size(img0,3);
 else
     % sinon, déduire un C théorique à partir des attributs si disponibles
-    C0 = 0;
-    for i = 1:numel(allIdx)
-        if ~isempty(allIdx{i})
-            C0 = max(C0, max(allIdx{i}));
-        end
-    end
-    if C0 == 0
-        % fallback minimal
-        C0 = k;
-    end
+    C0 = k;
 end
 
 % Décide où placer ce bloc:
+if isempty(img0)
+    destIdx = 1:k;
+end
 if isempty(destIdx)
     % Pas d'indices fournis -> on essaye de réutiliser un slot existant
     % si le canal existe déjà dans disp0.channel (par son nom)
@@ -753,7 +760,7 @@ img(:,:,destIdx,frameList) = blk;
 if isempty(chId0)
     % On doit reconstruire un id logique minimal: 1 logique unique
     channelid = zeros(1, size(img,3));
-    channelid(destIdx) = 1;
+    channelid(destIdx) = logicalIdWanted;
 else
     channelid = chId0;
     if numel(channelid) < size(img,3)
@@ -761,23 +768,24 @@ else
     end
     % Si le canal existe déjà (cas reuse), on garde l'id existant.
     % Sinon, on crée un nouveau "logique" à la fin.
-    if all(channelid(destIdx) == 0)
-        nextLogical = max(channelid) + 1;
-        channelid(destIdx) = nextLogical;
-    end
+    channelid(destIdx) = logicalIdWanted;
 end
 
 % --- Lire les attributs display pour ce canal
 att.intensity  = readAttOrDefault(h5File, pTarget, 'display_intensity',  [1 1 1]);
 att.rgb        = readAttOrDefault(h5File, pTarget, 'display_rgb',        [1 1 1]);
+att.colorMode  = readAttOrDefault(h5File, pTarget, 'display_color_mode', 'rgb');
+att.colormapName = readAttOrDefault(h5File, pTarget, 'display_colormap_name', '');
 att.displaylim = readAttOrDefault(h5File, pTarget, 'display_displaylim', [0; 1]);
 att.indexed    = readAttOrDefault(h5File, pTarget, 'display_indexed',    uint8(0));
 att.alpha      = readAttOrDefault(h5File, pTarget, 'display_alpha',      1);
 att.contour    = readAttOrDefault(h5File, pTarget, 'display_contour',    uint8(0));
 att.width      = readAttOrDefault(h5File, pTarget, 'display_contourwidth', 1);
+att.log        = readAttOrDefault(h5File, pTarget, 'display_log',         uint8(0));
 att.frame      = readAttOrDefault(h5File, pTarget, 'display_frame',      1);
 att.binning    = readAttOrDefault(h5File, pTarget, 'display_binning',    1);
 att.selectedchannel = readAttOrDefault(h5File, pTarget, 'display_selectedchannel', 1);
+att.valueTransform = readValueTransformOrDefault(h5File, pTarget);
 
 
 % --- Mettre à jour uniquement ce qu'il faut dans le display
@@ -887,6 +895,7 @@ end
 if ~isfield(dispStruct,'log') || isempty(dispStruct.log)
     dispStruct.log = zeros(1, Nlog);
 end
+dispStruct.log(logicalId) = double(att.log(1) ~= 0);
 
 % displaylim par sous-canal (colonnes destIdx)
 dlimChan = double(att.displaylim);
@@ -908,6 +917,12 @@ if ~isfield(dispStruct,'rgb') || size(dispStruct.rgb,1) < Nlog
     dispStruct.rgb = [cur; repmat([1 1 1], Nlog - size(cur,1), 1)];
 end
 dispStruct.rgb(logicalId,:) = double(att.rgb(:).');
+dispStruct.colorMode = ensureStringCellArray(dispStruct, 'colorMode', Nlog, 'rgb');
+dispStruct.colormapName = ensureStringCellArray(dispStruct, 'colormapName', Nlog, '');
+dispStruct.colorMode{logicalId} = char(string(att.colorMode));
+dispStruct.colormapName{logicalId} = char(string(att.colormapName));
+dispStruct.valueTransform = ensureValueTransformArray(dispStruct, Nlog);
+dispStruct.valueTransform(logicalId) = att.valueTransform;
 
 % stretchlim inchangé (si existant)
 % fin.
@@ -1005,6 +1020,117 @@ end
 % end
 % end
 
+function vt = readValueTransformOrDefault(h5File, h5Path)
+vt = rawValueTransform();
+try
+    mode = lower(strtrim(char(string(readAttOrDefault(h5File, h5Path, 'value_mode', 'raw')))));
+catch
+    mode = 'raw';
+end
+if ~strcmp(mode, 'physical')
+    return;
+end
+
+unit = 'physical';
+try
+    unit = char(string(readAttOrDefault(h5File, h5Path, 'physical_unit', unit)));
+catch
+end
+physicalMin = readAttOrDefault(h5File, h5Path, 'physical_min', NaN);
+physicalMax = readAttOrDefault(h5File, h5Path, 'physical_max', NaN);
+encodedMin = readAttOrDefault(h5File, h5Path, 'encoded_min', 0);
+encodedMax = readAttOrDefault(h5File, h5Path, 'encoded_max', 65535);
+transform = 'linear';
+try
+    transform = char(string(readAttOrDefault(h5File, h5Path, 'physical_transform', transform)));
+catch
+end
+
+physicalRange = double([physicalMin physicalMax]);
+encodedRange = double([encodedMin encodedMax]);
+if any(~isfinite(physicalRange)) || any(~isfinite(encodedRange)) || ...
+        physicalRange(2) <= physicalRange(1) || encodedRange(2) <= encodedRange(1)
+    vt = rawValueTransform();
+    return;
+end
+
+vt = struct( ...
+    'mode', 'physical', ...
+    'unit', unit, ...
+    'physicalRange', physicalRange, ...
+    'encodedRange', encodedRange, ...
+    'transform', transform);
+end
+
+function vt = ensureValueTransformArray(dispStruct, nLog)
+defaultValue = rawValueTransform();
+if isfield(dispStruct, 'valueTransform') && ~isempty(dispStruct.valueTransform) && isstruct(dispStruct.valueTransform)
+    oldValue = dispStruct.valueTransform(:).';
+else
+    oldValue = repmat(defaultValue, 1, 0);
+end
+vt = repmat(defaultValue, 1, numel(oldValue));
+for i = 1:numel(oldValue)
+    vt(i) = normalizeValueTransform(oldValue(i));
+end
+if numel(vt) < nLog
+    vt(end+1:nLog) = defaultValue;
+elseif numel(vt) > nLog
+    vt = vt(1:nLog);
+end
+end
+
+function value = ensureStringCellArray(dispStruct, fieldName, nLog, defaultValue)
+if isfield(dispStruct, fieldName) && ~isempty(dispStruct.(fieldName))
+    rawValue = dispStruct.(fieldName);
+    if isstring(rawValue)
+        value = cellstr(rawValue(:).');
+    elseif ischar(rawValue)
+        value = {rawValue};
+    elseif iscell(rawValue)
+        value = cell(1, numel(rawValue));
+        for i = 1:numel(rawValue)
+            value{i} = char(string(rawValue{i}));
+        end
+    else
+        value = {};
+    end
+else
+    value = {};
+end
+if numel(value) < nLog
+    value(end+1:nLog) = {defaultValue};
+elseif numel(value) > nLog
+    value = value(1:nLog);
+end
+end
+
+function s = normalizeValueTransform(s)
+defaultValue = rawValueTransform();
+try
+    if ~isfield(s, 'mode') || isempty(s.mode), s.mode = defaultValue.mode; end
+    if ~isfield(s, 'unit') || isempty(s.unit), s.unit = defaultValue.unit; end
+    if ~isfield(s, 'physicalRange') || isempty(s.physicalRange) || numel(s.physicalRange) ~= 2
+        s.physicalRange = defaultValue.physicalRange;
+    end
+    if ~isfield(s, 'encodedRange') || isempty(s.encodedRange) || numel(s.encodedRange) ~= 2
+        s.encodedRange = defaultValue.encodedRange;
+    end
+    if ~isfield(s, 'transform') || isempty(s.transform), s.transform = defaultValue.transform; end
+catch
+    s = defaultValue;
+end
+end
+
+function vt = rawValueTransform()
+vt = struct( ...
+    'mode', 'raw', ...
+    'unit', 'raw', ...
+    'physicalRange', [0 65535], ...
+    'encodedRange', [0 65535], ...
+    'transform', 'linear');
+end
+
 function dispStruct = rebuildDisplayFromAttrs(names, idxList, attrs, C)
 % names : {1xN} canaux logiques
 % idxList : {1xN} indices sous-channels pour chaque canal
@@ -1019,6 +1145,9 @@ alpha     = ones(1,N);
 contour   = zeros(1,N);
 width     = ones(1,N);
 selectedchannel = ones(1,N);
+logFlag   = zeros(1,N);
+colorMode = repmat({'rgb'}, 1, N);
+colormapName = repmat({''}, 1, N);
 
 rgbSub    = zeros(N,3);
 %rgbSub    = zeros(C,3);
@@ -1032,6 +1161,15 @@ for i = 1:N
     alpha(i)       = double(attrs(i).alpha(1));
     contour(i)     = double(attrs(i).contour(1));
     width(i)       = double(attrs(i).width(1));
+    if isfield(attrs, 'log') && ~isempty(attrs(i).log)
+        logFlag(i) = double(attrs(i).log(1) ~= 0);
+    end
+    if isfield(attrs, 'colorMode') && ~isempty(attrs(i).colorMode)
+        colorMode{i} = char(string(attrs(i).colorMode));
+    end
+    if isfield(attrs, 'colormapName') && ~isempty(attrs(i).colormapName)
+        colormapName{i} = char(string(attrs(i).colormapName));
+    end
     if localShouldForceIndexedChannel(names{i})
         intensity(i,:) = [0 0 0];
         indexed(i) = 1;
@@ -1076,7 +1214,13 @@ dispStruct.indexed         = indexed;            % 1 x N
 dispStruct.alpha           = alpha;              % 1 x N
 dispStruct.contour         = contour;            % 1 x N
 dispStruct.width           = width;              % 1 x N
-dispStruct.log             = zeros(1,N);
+dispStruct.log             = logFlag;
+dispStruct.colorMode       = colorMode;
+dispStruct.colormapName    = colormapName;
+dispStruct.valueTransform  = repmat(rawValueTransform(), 1, N);
+for i = 1:N
+    dispStruct.valueTransform(i) = attrs(i).valueTransform;
+end
 
 end
 

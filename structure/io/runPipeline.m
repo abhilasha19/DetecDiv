@@ -230,6 +230,7 @@ function [ctx, report] = runPipeline(pipe, ctx)
     ctx = updatePipelineProgress(ctx, '', total, total, 1, 1, 'Pipeline completed.');
     pipelineRunEvent(ctx, 'run_done', 'Summary', report.summary, ...
         'StartedAt', report.startedAt, 'EndedAt', report.endedAt);
+    detecdiv_emit_workspace_changed(ctx, report, 'done', 'runPipeline');
 end
 
 function ctx = preparePythonEnvironmentIfNeeded(pipe, ctx)
@@ -1063,6 +1064,7 @@ function ctx = executeNode(node, ctx)
         case 'dataloader'
             try
                 ctx = dataLoader.process(ctx);
+                ctx = markDataloaderFovSelectionApplied(ctx);
             catch ME
                 throwNodeFailed(node, ME);
             end
@@ -1117,6 +1119,49 @@ function ctx = executeNode(node, ctx)
 
     % optional output coherence check
     ctx = ensureOutputs(node, ctx);
+end
+
+function ctx = markDataloaderFovSelectionApplied(ctx)
+    if ~isstruct(ctx)
+        return;
+    end
+
+    useExistingProjectSources = false;
+    try
+        if isfield(ctx,'dataLoader') && isstruct(ctx.dataLoader) && ...
+                isfield(ctx.dataLoader,'useExistingProjectSources') && ~isempty(ctx.dataLoader.useExistingProjectSources)
+            useExistingProjectSources = logical(ctx.dataLoader.useExistingProjectSources);
+        end
+    catch
+        useExistingProjectSources = false;
+    end
+    if useExistingProjectSources
+        return;
+    end
+
+    appliedFovs = [];
+    try
+        if isfield(ctx,'dataLoader') && isstruct(ctx.dataLoader) && ...
+                isfield(ctx.dataLoader,'positionIdx') && ~isempty(ctx.dataLoader.positionIdx)
+            appliedFovs = normalizeIndexVectorLocal(ctx.dataLoader.positionIdx);
+        elseif isfield(ctx,'positionIdx') && ~isempty(ctx.positionIdx)
+            appliedFovs = normalizeIndexVectorLocal(ctx.positionIdx);
+        end
+    catch
+        appliedFovs = [];
+    end
+    if isempty(appliedFovs)
+        return;
+    end
+
+    if ~isfield(ctx,'sel') || ~isstruct(ctx.sel) || isempty(ctx.sel)
+        ctx.sel = struct();
+    end
+    ctx.sel.sourceFovs = appliedFovs;
+    ctx.sel.fovs = [];
+    if isfield(ctx,'run') && isstruct(ctx.run)
+        ctx.run.sourceFovIndex = appliedFovs;
+    end
 end
 
 function tf = shouldUseRoiMajorExecution(report, nodeMap, ctx)
@@ -1270,13 +1315,11 @@ function [ctx, report] = executeRoiMajorPipeline(pipe, ctx, report, nodeMap, edg
                 roiCtx.io.deferredSave = true;
                 roiCtx.io.cachePolicy = 'memory';
                 roiCtx.store.cacheMode = 'memory';
-                if r == 1
-                    pipelineRunEvent(roiCtx, 'node_start', 'NodeId', nodeId, ...
-                        'NodeType', getfielddefault(node,'type',''), 'NodeIndex', i, ...
-                        'TotalNodes', totalNodes, 'RunPolicy', policy.runPolicy, ...
-                        'ExistingPolicy', policy.existingPolicy, 'OutputName', policy.outputName, ...
-                        'ExecutionMode', 'roi_major', 'TotalRois', nRoi);
-                end
+                pipelineRunEvent(roiCtx, 'node_start', 'NodeId', nodeId, ...
+                    'NodeType', getfielddefault(node,'type',''), 'NodeIndex', i, ...
+                    'TotalNodes', totalNodes, 'RunPolicy', policy.runPolicy, ...
+                    'ExistingPolicy', policy.existingPolicy, 'OutputName', policy.outputName, ...
+                    'ExecutionMode', 'roi_major', 'RoiIndex', r, 'TotalRois', nRoi);
                 roiCtx = executeNode(node, roiCtx);
                 [nodeStatus, nodeMessage, roiCtx] = consumeNodeStatusOverride(roiCtx);
                 nodeStats(i).durationSec = nodeStats(i).durationSec + toc(tNode);
@@ -1288,6 +1331,11 @@ function [ctx, report] = executeRoiMajorPipeline(pipe, ctx, report, nodeMap, edg
                 if ~isempty(nodeMessage)
                     nodeStats(i).message = nodeMessage;
                 end
+                pipelineRunEvent(roiCtx, 'node_done', 'NodeId', nodeId, ...
+                    'NodeType', getfielddefault(node,'type',''), 'NodeIndex', i, ...
+                    'TotalNodes', totalNodes, 'Status', nodeStatus, ...
+                    'ExecutionMode', 'roi_major', 'RoiIndex', r, 'TotalRois', nRoi, ...
+                    'DurationSec', toc(tNode), 'Message', nodeMessage);
             catch ME
                 nodeStats(i).durationSec = nodeStats(i).durationSec + toc(tNode);
                 nodeStats(i).after = captureContextStats(roiCtx);
@@ -1371,10 +1419,12 @@ function [ctx, report] = executeRoiMajorPipeline(pipe, ctx, report, nodeMap, edg
     pipelineRunEvent(ctx, 'run_done', 'Summary', report.summary, ...
         'StartedAt', report.startedAt, 'EndedAt', report.endedAt, ...
         'ExecutionMode', 'roi_major');
+    detecdiv_emit_workspace_changed(ctx, report, 'done', 'runPipeline');
 end
 
 function saveFinalizedRoiLocal(roiobj, ctx)
-    dirty = struct('data', false, 'image', false);
+    roiId = safeRoiIdForRunLocal(roiobj);
+    dirty = struct('data', false, 'image', false, 'fullImage', false, 'channels', {{}});
     try
         if isstruct(roiobj.results) && isfield(roiobj.results, 'pipelineDeferredDirty') && isstruct(roiobj.results.pipelineDeferredDirty)
             dirty = roiobj.results.pipelineDeferredDirty;
@@ -1387,22 +1437,35 @@ function saveFinalizedRoiLocal(roiobj, ctx)
 
     if ~isfield(dirty,'data'), dirty.data = false; end
     if ~isfield(dirty,'image'), dirty.image = false; end
+    if ~isfield(dirty,'fullImage'), dirty.fullImage = false; end
+    if ~isfield(dirty,'channels'), dirty.channels = {}; end
     if ~dirty.data && roiHasSavableDataseriesLocal(roiobj)
         dirty.data = true;
     end
 
     if isMemoryOnlyOutputRunLocal(ctx)
-        disp(sprintf('[runPipeline] Final ROI save skipped for ROI %s: memory-only output mode.', safeRoiIdForRunLocal(roiobj)));
+        disp(sprintf('[runPipeline] Final ROI save skipped for ROI %s: memory-only output mode.', roiId));
         return;
     end
 
+    pipelineRunEvent(ctx, 'roi_final_save_start', 'RoiId', roiId, ...
+        'SaveData', logical(dirty.data), 'SaveImage', logical(dirty.image), ...
+        'FullImage', logical(dirty.fullImage), 'Channels', dirty.channels);
     if dirty.image
         try
-            roiobj.save;
-            disp(sprintf('[runPipeline] Final ROI save: image+data for ROI %s.', safeRoiIdForRunLocal(roiobj)));
+            saveChannels = cellstr(string(dirty.channels(:)))';
+            saveChannels = saveChannels(~cellfun(@isempty, saveChannels));
+            if ~dirty.fullImage && ~isempty(saveChannels)
+                roiobj.save(saveChannels);
+                disp(sprintf('[runPipeline] Final ROI save: %d image channel(s)+data for ROI %s.', ...
+                    numel(saveChannels), roiId));
+            else
+                roiobj.save;
+                disp(sprintf('[runPipeline] Final ROI save: image+data for ROI %s.', roiId));
+            end
         catch ME
             error('runPipeline:RoiFinalSaveFailed', ...
-                'Final save failed for ROI %s: %s', safeRoiIdForRunLocal(roiobj), ME.message);
+                'Final save failed for ROI %s: %s', roiId, ME.message);
         end
     elseif dirty.data
         try
@@ -1410,14 +1473,17 @@ function saveFinalizedRoiLocal(roiobj, ctx)
             if ~didSave
                 error('runPipeline:NoDataSaved', 'No savable dataseries was found.');
             end
-            disp(sprintf('[runPipeline] Final ROI save: data for ROI %s.', safeRoiIdForRunLocal(roiobj)));
+            disp(sprintf('[runPipeline] Final ROI save: data for ROI %s.', roiId));
         catch ME
             error('runPipeline:RoiFinalSaveFailed', ...
-                'Final data save failed for ROI %s: %s', safeRoiIdForRunLocal(roiobj), ME.message);
+                'Final data save failed for ROI %s: %s', roiId, ME.message);
         end
     else
-        disp(sprintf('[runPipeline] Final ROI save skipped: no deferred output for ROI %s.', safeRoiIdForRunLocal(roiobj)));
+        disp(sprintf('[runPipeline] Final ROI save skipped: no deferred output for ROI %s.', roiId));
     end
+    pipelineRunEvent(ctx, 'roi_final_save_done', 'RoiId', roiId, ...
+        'SaveData', logical(dirty.data), 'SaveImage', logical(dirty.image), ...
+        'FullImage', logical(dirty.fullImage), 'Channels', dirty.channels);
 
     try
         if isfield(ctx,'io') && isstruct(ctx.io) && isfield(ctx.io,'cachePolicy') && strcmp(ctx.io.cachePolicy, 'disk')
@@ -1621,9 +1687,9 @@ function p = getRuntimeNodeParams(ctx, node, paramField)
 p = getfielddefault(node, 'params', struct());
 try
     if isstruct(ctx) && isfield(ctx, paramField) && isstruct(ctx.(paramField))
-        p = ctx.(paramField);
+        p = mergeStruct(p, ctx.(paramField));
     elseif isstruct(ctx) && isfield(ctx, 'params') && isstruct(ctx.params)
-        p = ctx.params;
+        p = mergeStruct(p, ctx.params);
     end
 catch
     p = getfielddefault(node, 'params', struct());
@@ -1829,6 +1895,9 @@ function [missing, deferred] = missingParamsForNode(node, ctx, mode)
     for i = 1:numel(req)
         k = char(string(req{i}));
         scope = paramScopeForNode(node, k);
+        if strcmpi(k, 'path') && strcmpi(char(string(getfielddefault(node, 'type', ''))), 'classifier')
+            continue;
+        end
         if isfield(p,k) && ~isempty(p.(k))
             continue;
         end
@@ -2100,6 +2169,7 @@ function ctx = executeProcessorNode(node, ctx)
     procCtx.sel = getfielddefault(ctx, 'sel', struct());
     procCtx.pipeline = getfielddefault(ctx, 'pipeline', struct());
     procCtx.io = getfielddefault(ctx, 'io', struct());
+    procCtx.io.requiredChannels = requiredInputChannelsForNode(node, p);
     procCtx.store = getfielddefault(ctx, 'store', struct());
     procCtx.executionPolicy = getfielddefault(ctx, 'executionPolicy', struct());
     procCtx.cancel = getfielddefault(ctx, 'cancel', struct());
@@ -2211,6 +2281,75 @@ function ensureProcessorPackagePath(node, p, ctx)
                 char(string(getfielddefault(node, 'id', ''))), ME.message);
         end
     end
+end
+
+function channels = requiredInputChannelsForNode(node, params)
+channels = {};
+if nargin < 2 || ~isstruct(params)
+    params = struct();
+end
+try
+    contract = pipelineNodeContract(node);
+catch
+    contract = struct();
+end
+if ~isstruct(contract) || ~isfield(contract, 'resources') || ~isstruct(contract.resources) || ...
+        ~isfield(contract.resources, 'in')
+    return;
+end
+resources = contract.resources.in;
+for i = 1:numel(resources)
+    try
+        if ~isfield(resources(i), 'type') || ~strcmpi(char(string(resources(i).type)), 'channel')
+            continue;
+        end
+        key = '';
+        if isfield(resources(i), 'nameParam') && ~isempty(resources(i).nameParam)
+            key = char(string(resources(i).nameParam));
+        elseif isfield(resources(i), 'param') && ~isempty(resources(i).param)
+            key = char(string(resources(i).param));
+        elseif isfield(resources(i), 'symbol') && ~isempty(resources(i).symbol)
+            key = char(string(resources(i).symbol));
+        end
+        if isempty(key) || ~isfield(params, key)
+            continue;
+        end
+        channels = [channels normalizeChannelNameListLocal(params.(key))]; %#ok<AGROW>
+    catch
+    end
+end
+channels = unique(channels(~cellfun(@isempty, channels)), 'stable');
+end
+
+function channels = normalizeChannelNameListLocal(value)
+channels = {};
+if isempty(value)
+    return;
+end
+if iscell(value)
+    for i = 1:numel(value)
+        channels = [channels normalizeChannelNameListLocal(value{i})]; %#ok<AGROW>
+    end
+    return;
+end
+if isstring(value) || ischar(value)
+    if ischar(value) || (isstring(value) && isscalar(value))
+        vals = regexp(char(string(value)), '[,;]', 'split');
+    else
+        vals = cellstr(string(value(:)));
+    end
+elseif isnumeric(value) || islogical(value) || iscategorical(value)
+    vals = cellstr(string(value(:)));
+else
+    vals = {char(string(value))};
+end
+for i = 1:numel(vals)
+    s = strtrim(char(string(vals{i})));
+    if isempty(s) || startsWith(s, '<') || any(strcmpi(s, {'none','auto','n/a','<all>'}))
+        continue;
+    end
+    channels{end+1} = s; %#ok<AGROW>
+end
 end
 
 function value = getNodeCustomPackageField(node, p, fieldName)
@@ -2422,12 +2561,11 @@ end
 
 function ctx = executeClassifierNode(node, ctx)
     shallowObj = getShallowObject(ctx);
-    if isempty(shallowObj)
-        error('runPipeline:ClassifierNoProject', ...
-            'Classifier node %s requires a shallow project context.', char(string(node.id)));
-    end
-
     rois = selectRoisForNode(ctx, node);
+    if isempty(shallowObj) && isempty(rois)
+        error('runPipeline:ClassifierNoInput', ...
+            'Classifier node %s requires either a shallow project context or explicit ROI input.', char(string(node.id)));
+    end
     if isempty(rois)
         warning('runPipeline:ClassifierNoROI', ...
             'Classifier node %s has no ROI to classify; skipping.', char(string(node.id)));
@@ -2436,6 +2574,8 @@ function ctx = executeClassifierNode(node, ctx)
 
     pkgName = resolveNodePackage(node);
     p = getRuntimeNodeParams(ctx, node, 'classifier');
+    p = applyLocalPythonBackendToClassifierParams(p, pkgName, ctx);
+    intent = classifierRunIntent(ctx, p);
     refClassi = resolveClassifierReference(node, p, ctx);
     clsObj = classi('', 'pipeline_classifier', randi(1e9), 'InitTraining', false);
     clsObj.strid = char(string(node.id));
@@ -2488,8 +2628,37 @@ function ctx = executeClassifierNode(node, ctx)
             'io', getfielddefault(ctx, 'io', struct()), ...
             'store', getfielddefault(ctx, 'store', struct()), ...
             'cancel', getfielddefault(ctx, 'cancel', struct()), ...
-            'progress', getfielddefault(ctx, 'progress', struct()));
+            'progress', getfielddefault(ctx, 'progress', struct()), ...
+            'params', p);
+        clsObj.runProfiles.train = struct( ...
+            'io', getfielddefault(ctx, 'io', struct()), ...
+            'store', getfielddefault(ctx, 'store', struct()), ...
+            'cancel', getfielddefault(ctx, 'cancel', struct()), ...
+            'progress', getfielddefault(ctx, 'progress', struct()), ...
+            'run', getfielddefault(ctx, 'run', struct()), ...
+            'pipeline', getfielddefault(ctx, 'run', struct()), ...
+            'params', p);
     catch
+    end
+
+    if strcmp(intent, 'train')
+        try
+            clsObj.roi = rois;
+            clsObj.trainingset = 1:numel(rois);
+            if isprop(clsObj, 'dataset')
+                clsObj.dataset = struct('classes', {clsObj.classes}, 'channels', {{}}, ...
+                    'split', struct('train', 1:numel(rois), 'val', [], 'test', []));
+            end
+            checkPipelineCancelled(ctx, ['before classifier training ' char(string(node.id))]);
+            clsObj.trainClassifier;
+        catch ME
+            throwNodeFailed(node, ME);
+        end
+        ctx.roiList = rois;
+        ctx.dataSeries = collectDataSeriesFromRois(rois);
+        ctx.channels = inferChannelsFromRois(rois, ctx);
+        ctx.masks = inferMaskChannelsFromRois(rois);
+        return;
     end
 
     outputName = char(string(node.id));
@@ -2525,19 +2694,6 @@ function ctx = executeClassifierNode(node, ctx)
 
     [ctx, classifierForRun, classifierCNNForRun] = resolveRuntimeClassifierCache(ctx, clsObj, node);
 
-    args = {'OutputName', outputName, 'Ctx', ctx};
-    if ~isempty(classifierForRun)
-        args = [args {'Classifier', classifierForRun}]; %#ok<AGROW>
-    end
-    if ~isempty(classifierCNNForRun)
-        args = [args {'ClassifierCNN', classifierCNNForRun}]; %#ok<AGROW>
-    end
-    if isfield(ctx,'progressDlg') && ~isempty(ctx.progressDlg)
-        args = [args {'Progress', ctx.progressDlg}]; %#ok<AGROW>
-    end
-    if isfield(p,'frames') && ~isempty(p.frames)
-        args = [args {'Frames', p.frames}]; %#ok<AGROW>
-    end
     selectedChannels = [];
     if isfield(p,'channel') && ~isempty(p.channel)
         selectedChannels = p.channel;
@@ -2550,6 +2706,35 @@ function ctx = executeClassifierNode(node, ctx)
     end
     if ~isempty(selectedChannels)
         ch = normalizeClassifierChannels(selectedChannels);
+    else
+        ch = {};
+    end
+    classCtx = ctx;
+    classCtx.params = p;
+    classCtx.classifier = p;
+    if ~isfield(classCtx, 'io') || ~isstruct(classCtx.io)
+        classCtx.io = struct();
+    end
+    classCtx.io.requiredChannels = requiredInputChannelsForNode(node, p);
+    if isempty(classCtx.io.requiredChannels) && ~isempty(ch)
+        classCtx.io.requiredChannels = ch;
+    end
+
+    args = {'OutputName', outputName, 'Ctx', classCtx};
+    if ~isempty(classifierForRun)
+        args = [args {'Classifier', classifierForRun}]; %#ok<AGROW>
+    end
+    if ~isempty(classifierCNNForRun)
+        args = [args {'ClassifierCNN', classifierCNNForRun}]; %#ok<AGROW>
+    end
+    if isfield(ctx,'progressDlg') && ~isempty(ctx.progressDlg)
+        args = [args {'Progress', ctx.progressDlg}]; %#ok<AGROW>
+    end
+    framesForRun = classifierRuntimeFrames(p, ctx);
+    if ~isempty(framesForRun)
+        args = [args {'Frames', framesForRun}]; %#ok<AGROW>
+    end
+    if ~isempty(ch)
         args = [args {'Channel', ch}]; %#ok<AGROW>
     end
     if isfield(p,'parallel') && ~isempty(p.parallel) && logical(p.parallel)
@@ -2609,6 +2794,110 @@ if isfield(p,'moduleVar') && ~isempty(p.moduleVar)
         end
     catch
     end
+end
+end
+
+function intent = classifierRunIntent(ctx, p)
+intent = 'infer';
+try
+    if isstruct(p)
+        if isfield(p, 'operation') && ~isempty(p.operation)
+            intent = normalizeClassifierIntent(p.operation);
+            return;
+        elseif isfield(p, 'intent') && ~isempty(p.intent)
+            intent = normalizeClassifierIntent(p.intent);
+            return;
+        end
+    end
+catch
+end
+try
+    if isfield(ctx, 'run') && isstruct(ctx.run)
+        if isfield(ctx.run, 'classifierIntent') && ~isempty(ctx.run.classifierIntent)
+            intent = normalizeClassifierIntent(ctx.run.classifierIntent);
+            return;
+        elseif isfield(ctx.run, 'intent') && ~isempty(ctx.run.intent)
+            intent = normalizeClassifierIntent(ctx.run.intent);
+            return;
+        end
+    end
+catch
+end
+end
+
+function intent = normalizeClassifierIntent(value)
+txt = lower(strtrim(char(string(value))));
+switch txt
+    case {'train','training','fit'}
+        intent = 'train';
+    case {'validate','validation','val','test','evaluate','eval'}
+        intent = 'validate';
+    otherwise
+        intent = 'infer';
+end
+end
+
+function frames = classifierRuntimeFrames(p, ctx)
+frames = [];
+try
+    if isstruct(p) && isfield(p, 'frames') && ~isempty(p.frames)
+        frames = p.frames;
+        return;
+    end
+catch
+end
+try
+    if isfield(ctx, 'run') && isstruct(ctx.run) && isfield(ctx.run, 'frames') && ~isempty(ctx.run.frames)
+        frames = ctx.run.frames;
+        return;
+    end
+catch
+end
+try
+    if isfield(ctx, 'sel') && isstruct(ctx.sel) && isfield(ctx.sel, 'frames') && ~isempty(ctx.sel.frames)
+        frames = ctx.sel.frames;
+    end
+catch
+end
+end
+
+function p = applyLocalPythonBackendToClassifierParams(p, pkgName, ctx)
+try
+    pkg = lower(strtrim(char(string(pkgName))));
+catch
+    pkg = '';
+end
+if ~strcmp(pkg, 'sam31')
+    return;
+end
+
+target = '';
+try
+    if isstruct(ctx) && isfield(ctx, 'run') && isstruct(ctx.run) ...
+            && isfield(ctx.run, 'executionTarget') && ~isempty(ctx.run.executionTarget)
+        target = lower(strtrim(char(string(ctx.run.executionTarget))));
+    end
+catch
+    target = '';
+end
+if isempty(target)
+    try
+        if isstruct(ctx) && isfield(ctx, 'exec') && isstruct(ctx.exec) ...
+                && isfield(ctx.exec, 'python') && isstruct(ctx.exec.python) ...
+                && isfield(ctx.exec.python, 'backend') && ~isempty(ctx.exec.python.backend)
+            target = lower(strtrim(char(string(ctx.exec.python.backend))));
+        end
+    catch
+        target = '';
+    end
+end
+target = strrep(target, '-', '_');
+target = strrep(target, ' ', '_');
+
+if any(strcmp(target, {'local_wsl','wsl','localwsl','local_linux'}))
+    p.backend = 'wsl';
+elseif any(strcmp(target, {'local','windows','local_windows','local_matlab'}))
+    p.backend = 'local';
 end
 end
 
@@ -2916,7 +3205,13 @@ if ~isstruct(refInfo) || ~isfield(refInfo,'modulePath') || isempty(refInfo.modul
     return;
 end
 modulePath = char(string(refInfo.modulePath));
-if ~ispc && looksLikeWindowsAbsPath(modulePath)
+if ispc && startsWith(strrep(modulePath, '\', '/'), '/')
+    [mappedPath, mapped] = mapModulePathToLocalPath(modulePath, ctx);
+    if mapped && (exist(mappedPath, 'dir') == 7 || exist(mappedPath, 'file') == 2)
+        refInfo.modulePath = mappedPath;
+        return;
+    end
+elseif ~ispc && looksLikeWindowsAbsPath(modulePath)
     [mappedPath, mapped] = mapModulePathToServerPath(modulePath, ctx);
     if mapped && (exist(mappedPath, 'dir') == 7 || exist(mappedPath, 'file') == 2)
         refInfo.modulePath = mappedPath;
@@ -2995,6 +3290,10 @@ end
 
 function [mappedPath, mapped] = mapModulePathToServerPath(pathIn, ctx)
     [mappedPath, mapped] = detecdiv_paths_map_module_path(pathIn, ctx, 'server');
+end
+
+function [mappedPath, mapped] = mapModulePathToLocalPath(pathIn, ctx)
+    [mappedPath, mapped] = detecdiv_paths_map_module_path(pathIn, ctx, 'local');
 end
 
 function mappings = modulePathMappings(ctx)

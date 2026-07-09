@@ -243,6 +243,15 @@ classdef detecdiv < matlab.apps.AppBase
 
                 g3(i)=uitreenode(app.IndependentClassifiersNode,'Text',app.Data.Classifier{i},'Tag','Classifier','UserData',i,'ContextMenu',cm,'Icon',fullfile(pth,'brain.png'));
 
+                if isfield(app.Data,'ClassifierpipelineRun') && i <= numel(app.Data.ClassifierpipelineRun) && ...
+                        ~isempty(app.Data.ClassifierpipelineRun{i})
+                    runRoot = uitreenode(g3(i),'Text','Run','Tag','ClassifierpipelineRunRoot', ...
+                        'UserData',i,'Icon',fullfile(pth,'pipeline_run.png'));
+                    for k=1:numel(app.Data.ClassifierpipelineRun{i})
+                        createClassifierPipelineRunTreeNode(runRoot, i, k, pth);
+                    end
+                end
+
                 %                if numel(app.Data.Classifierrois{i})
 
                 %                    for n=1:numel(app.Data.Classifierrois{i})
@@ -340,6 +349,27 @@ classdef detecdiv < matlab.apps.AppBase
 
                 runNode=uitreenode(parentNode,'Text',app.Data.ProjectpipelineRun{projIdx}{runIdx},'Tag','ProjectpipelineRun', ...
                     'UserData',[projIdx,runIdx],'ContextMenu',cm,'Icon',fullfile(pth,'pipeline_run.png'));
+            end
+
+            function runNode = createClassifierPipelineRunTreeNode(parentNode, classifierIdx, runIdx, pth)
+                runNode = [];
+                if ~isfield(app.Data,'ClassifierpipelineRun') || classifierIdx > numel(app.Data.ClassifierpipelineRun) || ...
+                        runIdx > numel(app.Data.ClassifierpipelineRun{classifierIdx})
+                    return;
+                end
+
+                cm=uicontextmenu(app.DetecDivUIFigure);
+                m = uimenu(cm,'Text','Review run...');
+                m.MenuSelectedFcn = @(~,~)openClassifierPipelineRunInspector(app, classifierIdx, runIdx);
+                m = uimenu(cm,'Text','Edit run...');
+                m.MenuSelectedFcn = @(~,~)openClassifierPipelineRunEditor(app, classifierIdx, runIdx);
+                m = uimenu(cm,'Text','Open run log');
+                m.MenuSelectedFcn = @(~,~)openClassifierPipelineRunLog(app, classifierIdx, runIdx);
+                m = uimenu(cm,'Text','Open run folder');
+                m.MenuSelectedFcn = @(~,~)openClassifierPipelineRunFolder(app, classifierIdx, runIdx);
+
+                runNode=uitreenode(parentNode,'Text',app.Data.ClassifierpipelineRun{classifierIdx}{runIdx},'Tag','ClassifierpipelineRun', ...
+                    'UserData',[classifierIdx,runIdx],'ContextMenu',cm,'Icon',fullfile(pth,'pipeline_run.png'));
             end
 
             function contextMenuDeleteProcessFcn(src,event,arg,str)
@@ -1187,12 +1217,18 @@ end
                             tmpClassi.trainingFun = [pkgName '.train'];
                         end
 
-                        if strcmpi(pkgName,'cellposesam')
-                            tmpClassi.category = {'Pixel'};
-                        elseif strcmpi(pkgName,'cnn_lstm')
-                            tmpClassi.category = {'LSTM'};
-                        else
-                            tmpClassi.category = {'Image'};
+                        tmpClassi.category = {'Image'};
+                        try
+                            spec = feval([pkgName '.executionSpec'], tmpClassi);
+                            if isstruct(spec) && isfield(spec,'category') && ~isempty(spec.category)
+                                tmpClassi.category = classiNormalizeCategory(spec.category);
+                            elseif strcmpi(pkgName,'cnn_lstm')
+                                tmpClassi.category = {'LSTM'};
+                            end
+                        catch
+                            if strcmpi(pkgName,'cnn_lstm')
+                                tmpClassi.category = {'LSTM'};
+                            end
                         end
                     else
                         tmpClassi.category = {'Image'};
@@ -1455,10 +1491,17 @@ end
                     shallowObj.processing.pipelineRun(runIdx) = runObj;
                     assignin('base', projVar, shallowObj);
                     pipelineRunSave(runObj);
+                    reloadMsg = '';
+                    if any(strcmp(char(string(job.status)), {'done','failed','cancelled'}))
+                        [~, reloadMsg] = localReloadProjectFromDiskAfterHubTerminalStatus(projVar, shallowObj, runObj, runIdx);
+                    end
                     if showDialog
                         msg = sprintf('Hub job: %s\nStatus: %s', char(string(job.id)), char(string(job.status)));
                         if any(strcmp(char(string(job.status)), {'done','failed','cancelled'}))
-                            msg = sprintf('%s\n\nProject changed on hub/server. Reload before local editing.', msg);
+                            if isempty(reloadMsg)
+                                reloadMsg = 'Project changed on hub/server.';
+                            end
+                            msg = sprintf('%s\n\n%s', msg, reloadMsg);
                         end
                         uialert(app.DetecDivUIFigure, msg, 'Hub status', 'Icon', 'info');
                     end
@@ -1509,6 +1552,69 @@ end
                         jobId = char(string(runObj.ctx.run.control.jobId));
                     end
                 catch
+                end
+            end
+
+            function [ok, msg] = localReloadProjectFromDiskAfterHubTerminalStatus(projVar, shallowObj, runObj, runIdx)
+                ok = false;
+                msg = '';
+                projectMatPath = localProjectMatPath(shallowObj);
+                if isempty(projectMatPath) || exist(projectMatPath, 'file') ~= 2
+                    msg = 'Project changed on hub/server. Reload before local editing.';
+                    return;
+                end
+                try
+                    S = load(projectMatPath, 'shallowObj');
+                    if ~isfield(S, 'shallowObj') || ~isa(S.shallowObj, 'shallow')
+                        msg = 'Project changed on hub/server, but automatic reload failed.';
+                        return;
+                    end
+                    reloadedObj = S.shallowObj;
+                    try
+                        [pathstr, namestr] = fileparts(projectMatPath);
+                        if isunix || ismac
+                            reloadedObj.setPath([pathstr '/'], namestr);
+                        else
+                            reloadedObj.setPath([pathstr '\'], namestr);
+                        end
+                    catch
+                    end
+                    try
+                        if isfield(reloadedObj.processing, 'pipelineRun') ...
+                                && runIdx >= 1 && runIdx <= numel(reloadedObj.processing.pipelineRun)
+                            reloadedObj.processing.pipelineRun(runIdx) = runObj;
+                        end
+                    catch
+                    end
+                    assignin('base', projVar, reloadedObj);
+                    try
+                        app.autoLoadPipelinesForProjectRuns(reloadedObj);
+                    catch
+                    end
+                    try
+                        gatherVarsFromWorkspace(app);
+                        displayNodes(app);
+                    catch
+                    end
+                    ok = true;
+                    msg = 'Project reloaded from disk; local FOV/ROI tree has been refreshed.';
+                catch
+                    msg = 'Project changed on hub/server, but automatic reload failed. Reload before local editing.';
+                end
+            end
+
+            function projectMatPath = localProjectMatPath(projectObj)
+                projectMatPath = '';
+                try
+                    if isempty(projectObj) || ~isa(projectObj, 'shallow')
+                        return;
+                    end
+                    if isempty(projectObj.io.path) || isempty(projectObj.io.file)
+                        return;
+                    end
+                    projectMatPath = fullfile(char(string(projectObj.io.path)), [char(string(projectObj.io.file)) '.mat']);
+                catch
+                    projectMatPath = '';
                 end
             end
 
@@ -2130,7 +2236,7 @@ end
 
         function gatherVarsFromWorkspace(app)
             varlist=evalin('base','who');
-            st=struct('Project',{{}},'Classifier',{{}},'Pipeline',{{}},'PipelineDisplay',{{}},'PipelineModules',{{}},'PipelineModuleIds',{{}},'PipelineModuleTypes',{{}},'Projectpos',{{}},'Projectclassi',{{}},'Projectprocess',{{}},'ProjectpipelineRun',{{}},'Projectposrois',{{}},'Projectclassirois',{{}},'Classifierrois',{{}});
+            st=struct('Project',{{}},'Classifier',{{}},'Pipeline',{{}},'PipelineDisplay',{{}},'PipelineModules',{{}},'PipelineModuleIds',{{}},'PipelineModuleTypes',{{}},'Projectpos',{{}},'Projectclassi',{{}},'Projectprocess',{{}},'ProjectpipelineRun',{{}},'Projectposrois',{{}},'Projectclassirois',{{}},'Classifierrois',{{}},'ClassifierpipelineRun',{{}},'ClassifierpipelineRunPath',{{}});
             cc=0;
             cd=0;
             cp=0;
@@ -2188,7 +2294,51 @@ end
                     end
 
                     tmprun={};
+                    [tmp, runsLoadedFromDisk] = app.ensureProjectPipelineRunsLoaded(tmp);
+                    if runsLoadedFromDisk
+                        try
+                            assignin('base', varlist{i}, tmp);
+                        catch
+                        end
+                    end
                     if isfield(tmp.processing,'pipelineRun') && ~isempty(tmp.processing.pipelineRun)
+                        runs = tmp.processing.pipelineRun;
+                        keep = true(1, numel(runs));
+                        seenRuns = containers.Map('KeyType','char','ValueType','logical');
+                        for k=1:numel(runs)
+                            runObj = runs(k);
+                            runKey = '';
+                            try
+                                if isprop(runObj,'path') && ~isempty(runObj.path)
+                                    runKey = app.normalizeFsPath(runObj.path);
+                                end
+                            catch
+                            end
+                            if isempty(runKey)
+                                parts = {};
+                                try, parts{end+1} = char(string(runObj.runId)); catch, parts{end+1} = ['run_' num2str(k)]; end %#ok<AGROW>
+                                try, parts{end+1} = app.normalizePipelineRootPath(runObj.templatePath); catch, parts{end+1} = ''; end %#ok<AGROW>
+                                try
+                                    if isprop(runObj,'pipelineRef') && isstruct(runObj.pipelineRef) && isfield(runObj.pipelineRef,'path')
+                                        parts{end+1} = app.normalizePipelineRootPath(runObj.pipelineRef.path); %#ok<AGROW>
+                                    end
+                                catch
+                                end
+                                runKey = strjoin(parts, '|');
+                            end
+                            if isempty(runKey)
+                                runKey = ['run_index_' num2str(k)];
+                            end
+                            if isKey(seenRuns, runKey)
+                                keep(k) = false;
+                            else
+                                seenRuns(runKey) = true;
+                            end
+                        end
+                        if any(~keep)
+                            runs = runs(keep);
+                            tmp.processing.pipelineRun = runs;
+                        end
                         for k=1:numel(tmp.processing.pipelineRun)
                             runObj = tmp.processing.pipelineRun(k);
                             runName = runObj.runId;
@@ -2299,6 +2449,9 @@ end
                     st.Classifier{cd}=varlist{i};
 
                     st.Classifierrois{cd}={};
+                    [runLabels, runPaths] = app.listClassifierPipelineRuns(tmp);
+                    st.ClassifierpipelineRun{cd} = runLabels;
+                    st.ClassifierpipelineRunPath{cd} = runPaths;
 
                 end
 
@@ -2308,6 +2461,87 @@ end
             app.Data=st;
 
             %  st
+        end
+
+        function [shallowObj, loaded] = ensureProjectPipelineRunsLoaded(app, shallowObj)
+            loaded = false;
+            if isempty(shallowObj) || ~isa(shallowObj, 'shallow')
+                return;
+            end
+
+            hasRuns = false;
+            try
+                hasRuns = isfield(shallowObj.processing, 'pipelineRun') && ~isempty(shallowObj.processing.pipelineRun);
+            catch
+                hasRuns = false;
+            end
+            if hasRuns
+                return;
+            end
+
+            projectRoot = '';
+            try
+                projectRoot = fullfile(char(string(shallowObj.io.path)), char(string(shallowObj.io.file)));
+            catch
+                projectRoot = '';
+            end
+            if isempty(projectRoot)
+                return;
+            end
+
+            pipelineRoot = fullfile(projectRoot, 'pipeline');
+            if exist(pipelineRoot, 'dir') ~= 7
+                return;
+            end
+
+            listpipe = dir(pipelineRoot);
+            listpipe = listpipe(arrayfun(@(x)x.isdir, listpipe));
+            listpipe = listpipe(~ismember({listpipe.name}, {'.','..'}));
+            if isempty(listpipe)
+                return;
+            end
+
+            order = zeros(1, numel(listpipe));
+            for j = 1:numel(listpipe)
+                suffix = regexp(listpipe(j).name, '\d+$', 'match');
+                if ~isempty(suffix)
+                    order(j) = str2double(suffix{1});
+                else
+                    order(j) = j;
+                end
+            end
+            [~, ix] = sort(order);
+            listpipe = listpipe(ix);
+
+            pipeList = pipelineRun.empty;
+            for j = 1:numel(listpipe)
+                runPath = fullfile(pipelineRoot, listpipe(j).name);
+                try
+                    [runObj, msg] = pipelineRunLoad(runPath);
+                    if isempty(runObj)
+                        if ~isempty(msg)
+                            runJson = fullfile(runPath, 'run.json');
+                            isPendingRunWrite = contains(char(string(msg)), 'Pipeline run JSON not found') && exist(runJson, 'file') ~= 2;
+                            if ~isPendingRunWrite
+                                warning('detecdiv:PipelineRunLoadFailed', 'pipelineRunLoad failed for %s: %s', runPath, msg);
+                            end
+                        end
+                        continue;
+                    end
+                    pipeList(end+1) = runObj; %#ok<AGROW>
+                catch ME
+                    warning('detecdiv:PipelineRunLoadError', 'pipelineRunLoad error for %s: %s', runPath, ME.message);
+                end
+            end
+
+            if isempty(pipeList)
+                return;
+            end
+            if ~isfield(shallowObj.processing, 'pipelineRun')
+                shallowObj.processing.pipelineRun = pipelineRun.empty;
+            end
+            shallowObj.processing.pipelineRun = pipeList;
+            loaded = true;
         end
 
         function tf = isInternalPipelineGuiAlias(app, pipeObj, varName) %#ok<INUSD>
@@ -2371,6 +2605,58 @@ end
                 end
                 labels{n} = [num2str(n) ' - ' roiId];
             end
+        end
+
+        function tf = treeNodeHasChildTag(app, node, tagName) %#ok<INUSD>
+            tf = false;
+            try
+                children = node.Children;
+                for ii = 1:numel(children)
+                    if strcmp(children(ii).Tag, tagName)
+                        tf = true;
+                        return;
+                    end
+                end
+            catch
+                tf = false;
+            end
+        end
+
+        function ensureProjectPositionRoiTreeExpanded(app, positionNode, shallowObj, projIdx, posIdx)
+            if app.treeNodeHasChildTag(positionNode, 'Projectposrois')
+                try, expand(positionNode); catch, end
+                return;
+            end
+
+            roiLabels = buildRoiTreeLabels(app, shallowObj.fov(posIdx).roi);
+            if isempty(roiLabels)
+                return;
+            end
+
+            d = uiprogressdlg(app.DetecDivUIFigure, ...
+                'Title', 'Please Wait...', ...
+                'Message', 'Generating ROI list...', ...
+                'Value', 0);
+            cleanupObj = onCleanup(@() app.safeCloseProgressDialog(d)); %#ok<NASGU>
+            drawnow limitrate;
+
+            [pth, ~, ~] = fileparts(which('detecdiv.mlapp'));
+            nRoi = numel(roiLabels);
+            for n = 1:nRoi
+                if n == 1 || n == nRoi || mod(n, 10) == 0
+                    d.Value = n ./ nRoi;
+                    d.Message = ['Generating ROI list... ' num2str(n) '/' num2str(nRoi)];
+                    drawnow limitrate;
+                end
+                uitreenode(positionNode, ...
+                    'Text', roiLabels{n}, ...
+                    'Tag', 'Projectposrois', ...
+                    'UserData', [projIdx, posIdx, n], ...
+                    'Icon', fullfile(pth, 'roi.png'));
+            end
+
+            try, expand(positionNode); catch, end
+            drawnow limitrate;
         end
 
 
@@ -2536,12 +2822,18 @@ end
                         tmpClassi.trainingFun = [pkgName '.train'];
                     end
 
-                    if strcmpi(pkgName,'cellposesam')
-                        tmpClassi.category = {'Pixel'};
-                    elseif strcmpi(pkgName,'cnn_lstm')
-                        tmpClassi.category = {'LSTM'};
-                    else
-                        tmpClassi.category = {'Image'};
+                    tmpClassi.category = {'Image'};
+                    try
+                        spec = feval([pkgName '.executionSpec'], tmpClassi);
+                        if isstruct(spec) && isfield(spec,'category') && ~isempty(spec.category)
+                            tmpClassi.category = classiNormalizeCategory(spec.category);
+                        elseif strcmpi(pkgName,'cnn_lstm')
+                            tmpClassi.category = {'LSTM'};
+                        end
+                    catch
+                        if strcmpi(pkgName,'cnn_lstm')
+                            tmpClassi.category = {'LSTM'};
+                        end
                     end
                 else
                     tmpClassi.category = {'Image'};
@@ -5265,7 +5557,7 @@ function openRecentProjectCallback(app, projectPath)
     d.Value = 0.66;
     pause(0.2);
 
-    name = proj.io.file;
+    name = makeSafeVariableName(proj.io.file);
     assignin('base', name, proj);
 
 
@@ -5639,12 +5931,18 @@ end
                         tmpClassi.trainingFun = [pkgName '.train'];
                     end
 
-                    if strcmpi(pkgName,'cellposesam')
-                        tmpClassi.category = {'Pixel'};
-                    elseif strcmpi(pkgName,'cnn_lstm')
-                        tmpClassi.category = {'LSTM'};
-                    else
-                        tmpClassi.category = {'Image'};
+                    tmpClassi.category = {'Image'};
+                    try
+                        spec = feval([pkgName '.executionSpec'], tmpClassi);
+                        if isstruct(spec) && isfield(spec,'category') && ~isempty(spec.category)
+                            tmpClassi.category = classiNormalizeCategory(spec.category);
+                        elseif strcmpi(pkgName,'cnn_lstm')
+                            tmpClassi.category = {'LSTM'};
+                        end
+                    catch
+                        if strcmpi(pkgName,'cnn_lstm')
+                            tmpClassi.category = {'LSTM'};
+                        end
                     end
                 else
                     tmpClassi.category = {'Image'};
@@ -5787,8 +6085,232 @@ end
             if isempty(app) || ~isvalid(app) || isempty(app.DetecDivUIFigure) || ~isvalid(app.DetecDivUIFigure)
                 return;
             end
+            app.syncProjectFromWorkspaceEvent(payload);
+            try
+                gatherVarsFromWorkspace(app);
+                displayNodes(app);
+            catch
+            end
             RefreshtreewindowMenuSelected(app, []);
             drawnow limitrate;
+        end
+
+        function syncProjectFromWorkspaceEvent(app, payload) %#ok<INUSD>
+            if nargin < 2 || ~isstruct(payload)
+                return;
+            end
+
+            projectObj = [];
+            if isfield(payload, 'projectObj') && isa(payload.projectObj, 'shallow')
+                projectObj = payload.projectObj;
+            elseif isfield(payload, 'shallowObj') && isa(payload.shallowObj, 'shallow')
+                projectObj = payload.shallowObj;
+            elseif isfield(payload, 'shallow') && isa(payload.shallow, 'shallow')
+                projectObj = payload.shallow;
+            end
+
+            projectMatPath = '';
+            if isfield(payload, 'projectMatPath') && ~isempty(payload.projectMatPath)
+                projectMatPath = char(string(payload.projectMatPath));
+            elseif isfield(payload, 'projectPath') && ~isempty(payload.projectPath)
+                projectMatPath = app.projectMatPathFromEventPath(payload.projectPath);
+            end
+
+            if isempty(projectObj) && ~isempty(projectMatPath) && exist(projectMatPath, 'file') == 2
+                try
+                    projectObj = app.loadProjectMatRaw(projectMatPath);
+                catch ME
+                    warning('detecdiv:WorkspaceEventLoadFailed', ...
+                        'Unable to load project from event path "%s": %s', projectMatPath, ME.message);
+                end
+            end
+
+            if isempty(projectObj) || ~isa(projectObj, 'shallow')
+                return;
+            end
+
+            varName = app.projectWorkspaceVarNameFromEvent(payload, projectObj);
+            if isempty(varName)
+                return;
+            end
+
+            try
+                assignin('base', varName, projectObj);
+            catch ME
+                warning('detecdiv:WorkspaceEventAssignFailed', ...
+                    'Unable to publish project "%s" to base workspace: %s', varName, ME.message);
+            end
+        end
+
+        function [labels, runPaths] = listClassifierPipelineRuns(app, clas) %#ok<INUSD>
+            labels = {};
+            runPaths = {};
+            if isempty(clas) || ~isa(clas,'classi')
+                return;
+            end
+            classiPath = '';
+            try
+                classiPath = char(string(clas.path));
+            catch
+            end
+            if isempty(classiPath)
+                return;
+            end
+            runRoot = fullfile(classiPath, 'pipeline_runs');
+            if exist(runRoot, 'dir') ~= 7
+                return;
+            end
+
+            dd = dir(runRoot);
+            if isempty(dd)
+                return;
+            end
+            dd = dd([dd.isdir]);
+            names = {dd.name};
+            keep = ~ismember(names, {'.','..'});
+            dd = dd(keep);
+            if isempty(dd)
+                return;
+            end
+            [~, order] = sort(lower({dd.name}));
+            dd = dd(order);
+
+            for ir = 1:numel(dd)
+                candidate = fullfile(runRoot, dd(ir).name);
+                runJson = fullfile(candidate, 'run.json');
+                if exist(runJson, 'file') ~= 2
+                    continue;
+                end
+                label = dd(ir).name;
+                try
+                    [runObj, msg] = pipelineRunLoad(runJson);
+                    if ~isempty(runObj)
+                        runName = app.formatPipelineRunLabel(runObj, ir);
+                        runStatus = '';
+                        try
+                            if isprop(runObj,'status') && ~isempty(runObj.status)
+                                runStatus = char(string(runObj.status));
+                            end
+                        catch
+                        end
+                        if isempty(runStatus)
+                            label = runName;
+                        else
+                            label = [runName ' (' runStatus ')'];
+                        end
+                    elseif ~isempty(msg)
+                        label = [label ' (unreadable)'];
+                    end
+                catch
+                    label = [label ' (unreadable)'];
+                end
+                labels{end+1} = label; %#ok<AGROW>
+                runPaths{end+1} = candidate; %#ok<AGROW>
+            end
+        end
+
+        function matPath = projectMatPathFromEventPath(app, projectPath) %#ok<INUSD>
+            matPath = '';
+            if isempty(projectPath)
+                return;
+            end
+            p = char(string(projectPath));
+            if exist(p, 'file') == 2
+                matPath = p;
+                return;
+            end
+            if exist([p '.mat'], 'file') == 2
+                matPath = [p '.mat'];
+                return;
+            end
+            if exist(p, 'dir') == 7
+                [parentDir, projectName] = fileparts(p);
+                candidate = fullfile(parentDir, [projectName '.mat']);
+                if exist(candidate, 'file') == 2
+                    matPath = candidate;
+                end
+            end
+        end
+
+        function varName = projectWorkspaceVarNameFromEvent(app, payload, projectObj) %#ok<INUSD>
+            varName = '';
+            if isfield(payload, 'projectVarName') && ~isempty(payload.projectVarName)
+                varName = char(string(payload.projectVarName));
+            end
+            if isempty(varName) && isfield(payload, 'workspaceVar') && ~isempty(payload.workspaceVar)
+                varName = char(string(payload.workspaceVar));
+            end
+            if isempty(varName)
+                varName = app.findExistingProjectWorkspaceVar(projectObj);
+            end
+            if isempty(varName)
+                try
+                    varName = char(string(projectObj.id));
+                catch
+                    varName = '';
+                end
+            end
+            if isempty(varName)
+                try
+                    [~, file] = projectObj.getPath;
+                    varName = char(string(file));
+                catch
+                    varName = '';
+                end
+            end
+            varName = matlab.lang.makeValidName(varName);
+            if isempty(varName)
+                varName = 'shallowObj';
+            end
+        end
+
+        function varName = findExistingProjectWorkspaceVar(app, projectObj) %#ok<INUSD>
+            varName = '';
+            if isempty(projectObj) || ~isa(projectObj, 'shallow')
+                return;
+            end
+            targetPath = '';
+            targetFile = '';
+            try
+                [targetPath, targetFile] = projectObj.getPath;
+            catch
+            end
+            targetId = '';
+            try
+                targetId = char(string(projectObj.id));
+            catch
+            end
+
+            try
+                vars = evalin('base', 'who');
+            catch
+                vars = {};
+            end
+            for iVar = 1:numel(vars)
+                try
+                    candidate = evalin('base', vars{iVar});
+                catch
+                    continue;
+                end
+                if ~isa(candidate, 'shallow')
+                    continue;
+                end
+                try
+                    [candidatePath, candidateFile] = candidate.getPath;
+                    if ~isempty(targetPath) && strcmp(candidatePath, targetPath) && strcmp(candidateFile, targetFile)
+                        varName = vars{iVar};
+                        return;
+                    end
+                catch
+                end
+                try
+                    if ~isempty(targetId) && strcmp(char(string(candidate.id)), targetId)
+                        varName = vars{iVar};
+                        return;
+                    end
+                catch
+                end
+            end
         end
 
         function applyMainWindowLayout(app)
@@ -6040,12 +6562,14 @@ end
                     t=[t defaultPipePath newline newline];
                 end
 
+                nRuns = 0;
                 if isfield(shallowObj.processing,'pipelineRun')
-                    t=[t 'Number of pipeline runs in project: ' num2str(numel(shallowObj.processing.pipelineRun)) newline newline];
+                    nRuns = numel(shallowObj.processing.pipelineRun);
+                    t=[t 'Number of pipeline runs in project: ' num2str(nRuns) newline newline];
                 end
                 try
                     runTemplates = {};
-                    if isfield(shallowObj.processing,'pipelineRun') && ~isempty(shallowObj.processing.pipelineRun)
+                    if nRuns > 0
                         runs = shallowObj.processing.pipelineRun;
                         for ir = 1:numel(runs)
                             if isprop(runs(ir),'pipelineRef') && isstruct(runs(ir).pipelineRef)
@@ -6065,19 +6589,15 @@ end
                     end
                 catch
                 end
-                t=[t 'Open a project run to inspect or edit the exact pipeline instance used for that run.' newline];
+                if nRuns > 0
+                    t=[t 'Open a project run to inspect or edit the exact pipeline instance used for that run.' newline];
+                end
                 t=[t 'Use the Pipeline section for standalone templates.' newline];
                 app.ProjectInformationLabel.Text=t;
 
                 app.AdddataButton.Visible='off';
-                app.AddclassifierButton.Visible='on';
-                app.AddclassifierButton.Text='Open latest run...';
-                app.AddclassifierButton.Tooltip={'Open the most recent pipeline run for this project in edit mode.'};
-                app.AddclassifierButton.Position = [232 12 185 43];
-                app.UpdaterawdatapathButton.Visible='on';
-                app.UpdaterawdatapathButton.Text='New pipeline template...';
-                app.UpdaterawdatapathButton.Tooltip={'Create a new pipeline template inside this project folder and open it with this project context.'};
-                app.UpdaterawdatapathButton.Position = [20 12 185 43];
+                app.AddclassifierButton.Visible='off';
+                app.UpdaterawdatapathButton.Visible='off';
                 app.IdentifyROIsinpositionsButton.Visible='off';
                 app.ExtractROIhypervolumesButton.Visible='off';
 
@@ -6102,24 +6622,7 @@ end
                 shallowObj=evalin('base',proj);
                 position=shallowObj.fov(pos);
 
-                % display sub,odes
-
-                if numel(app.Tree.SelectedNodes.Children)==0
-                    roiLabels = buildRoiTreeLabels(app, position.roi);
-                    if ~isempty(roiLabels)
-
-                        for n=1:numel(roiLabels)
-
-                            % aa=app.Data.Projectclassirois{i}{k}{n}
-                            %   cm=uicontextmenu(app.DetecDivUIFigure);
-                            %  m = uimenu(cm,'Text','Open ROI...');
-                            %  m.MenuSelectedFcn={@contextMenuROIFcn,[i,k,n],'Projectposrois'};
-                            [pth fle ext]= fileparts(which('detecdiv.mlapp'));
-                            uitreenode(app.Tree.SelectedNodes,'Text',roiLabels{n},'Tag','Projectposrois','UserData',[cc(1),cc(2),n],'Icon',fullfile(pth,'roi.png'));
-                            % disabled because too heavy with large projects
-                        end
-                    end
-                end
+                app.ensureProjectPositionRoiTreeExpanded(app.Tree.SelectedNodes, shallowObj, cc(1), cc(2));
 
 
                 % display text
@@ -6173,11 +6676,28 @@ end
                 shallowObj=evalin('base',proj);
                 clas=shallowObj.processing.classification(pos);
 
-                if numel(app.Tree.SelectedNodes.Children)==0
+                if ~app.treeNodeHasChildTag(app.Tree.SelectedNodes, 'Classifierrois')
                     roiLabels = buildRoiTreeLabels(app, clas.roi);
                     if ~isempty(roiLabels)
                         [pth fle ext]= fileparts(which('detecdiv.mlapp'));
+                        nRoi = numel(roiLabels);
+                        roiProgressDialog = [];
+                        roiProgressCleanup = [];
+                        if nRoi >= 25
+                            roiProgressDialog = uiprogressdlg(app.DetecDivUIFigure, ...
+                                'Title', 'Please Wait...', ...
+                                'Message', 'Generating classifier ROI list...', ...
+                                'Value', 0);
+                            roiProgressCleanup = onCleanup(@() app.safeCloseProgressDialog(roiProgressDialog)); %#ok<NASGU>
+                            drawnow limitrate;
+                        end
                         for n=1:numel(roiLabels)
+                            if ~isempty(roiProgressDialog) && isvalid(roiProgressDialog) && ...
+                                    (n == 1 || n == nRoi || mod(n, 10) == 0)
+                                roiProgressDialog.Value = n ./ nRoi;
+                                roiProgressDialog.Message = ['Generating classifier ROI list... ' num2str(n) '/' num2str(nRoi)];
+                                drawnow limitrate;
+                            end
                             % aa=app.Data.Projectclassirois{i}{k}{n}
                             cm=uicontextmenu(app.DetecDivUIFigure);
                             m = uimenu(cm,'Text','Open ROI...');
@@ -6186,6 +6706,7 @@ end
                             uitreenode(app.Tree.SelectedNodes,'Text',roiLabels{n},'Tag','Projectclassirois','UserData',[cc(1),cc(2),n],'Icon',fullfile(pth,'roi.png'));
                             % disabled because too heavy with large projects
                         end
+                        clear roiProgressCleanup
                     end
                 end
 
@@ -6306,21 +6827,38 @@ end
                 clas=evalin('base',proj);
 
 
-                if numel(app.Tree.SelectedNodes.Children)==0
+                if ~app.treeNodeHasChildTag(app.Tree.SelectedNodes, 'Classifierrois')
                     roiLabels = buildRoiTreeLabels(app, clas.roi);
                     if ~isempty(roiLabels)
-
+                        nRoi = numel(roiLabels);
+                        roiProgressDialog = [];
+                        roiProgressCleanup = [];
+                        if nRoi >= 25
+                            roiProgressDialog = uiprogressdlg(app.DetecDivUIFigure, ...
+                                'Title', 'Please Wait...', ...
+                                'Message', 'Generating classifier ROI list...', ...
+                                'Value', 0);
+                            roiProgressCleanup = onCleanup(@() app.safeCloseProgressDialog(roiProgressDialog)); %#ok<NASGU>
+                            drawnow limitrate;
+                        end
                         for n=1:numel(roiLabels)
+                            if ~isempty(roiProgressDialog) && isvalid(roiProgressDialog) && ...
+                                    (n == 1 || n == nRoi || mod(n, 10) == 0)
+                                roiProgressDialog.Value = n ./ nRoi;
+                                roiProgressDialog.Message = ['Generating classifier ROI list... ' num2str(n) '/' num2str(nRoi)];
+                                drawnow limitrate;
+                            end
                             % aa=app.Data.Projectclassirois{i}{k}{n}
                             cm=uicontextmenu(app.DetecDivUIFigure);
                             m = uimenu(cm,'Text','Open ROI...');
-                            m.MenuSelectedFcn={@contextMenuROIFcn,[cc,n],'Projectposrois'};
+                            m.MenuSelectedFcn={@contextMenuROIFcn,[cc,n],'Classifierrois'};
                             %  'ContextMenu',cm
                             [pth fle ext]= fileparts(which('detecdiv.mlapp'));
 
                             uitreenode(app.Tree.SelectedNodes,'Text',roiLabels{n},'Tag','Classifierrois','UserData',[cc,n],'Icon',fullfile(pth,'roi.png'));
                             % disabled because too heavy with large projects
                         end
+                        clear roiProgressCleanup
                     end
                 end
 
@@ -6645,6 +7183,69 @@ end
                 end
             end
 
+            if strcmp(selectedNodes.Tag,'ClassifierpipelineRun')
+                app.ProjectsPanel.Title='Pipeline run';
+                app.InspectRunButton.Visible='on';
+                app.InspectRunButton.Text='Review run...';
+                app.setComponentVisible('EditRunButton', 'on');
+                app.setComponentText('EditRunButton', 'Edit run...');
+                app.OpenButton.Visible='on';
+                app.OpenButton.Text='Open run folder...';
+
+                cc=app.Tree.SelectedNodes.UserData;
+                [runObj, clas] = app.getClassifierPipelineRun(cc(1), cc(2));
+                if ~isempty(runObj)
+                    t='';
+                    t=[t 'Run id: ' runObj.runId newline newline];
+                    [runMode, runStatus] = app.summarizePipelineRun(runObj);
+                    t=[t 'Execution: ' runMode newline];
+                    t=[t 'Status: ' runStatus newline newline];
+                    t=[t 'Attached classifier: ' app.Data.Classifier{cc(1)} newline];
+                    try
+                        if ~isempty(clas) && isprop(clas,'path')
+                            t=[t 'Classifier path: ' char(string(clas.path)) newline];
+                        end
+                    catch
+                    end
+                    try
+                        [runPath, ~] = runObj.getPath;
+                        t=[t 'Run path: ' runPath newline newline];
+                    catch
+                        t=[t newline];
+                    end
+                    t=[t 'Review run opens the immutable execution record and artifacts.' newline];
+                    t=[t 'Edit run reopens this run configuration in pipeline2.' newline newline];
+                    if isprop(runObj,'description') && ~isempty(runObj.description)
+                        t=[t 'Description: ' char(string(runObj.description)) newline newline];
+                    end
+                    if isprop(runObj,'pipelineRef') && isstruct(runObj.pipelineRef)
+                        if isfield(runObj.pipelineRef,'id')
+                            t=[t 'Pipeline id: ' char(string(runObj.pipelineRef.id)) newline];
+                        end
+                        if isfield(runObj.pipelineRef,'path')
+                            t=[t 'Pipeline path: ' char(string(runObj.pipelineRef.path)) newline];
+                        end
+                    end
+                    try
+                        review = pipelineRunReview(runObj, 'Write', false);
+                        if isstruct(review) && isfield(review,'summary') && isstruct(review.summary)
+                            sumrep = review.summary;
+                            t=[t newline 'Stored review summary:' newline];
+                            t=[t '- totalNodes: ' char(string(numel(review.nodes))) newline];
+                            sumFields = {'doneNodes','skippedNodes','failedNodes','cancelledNodes','startedAt','endedAt'};
+                            for isf = 1:numel(sumFields)
+                                key = sumFields{isf};
+                                if isfield(sumrep, key) && ~isempty(sumrep.(key))
+                                    t=[t '- ' key ': ' char(string(sumrep.(key))) newline]; %#ok<AGROW>
+                                end
+                            end
+                        end
+                    catch
+                    end
+                    app.ProjectInformationLabel.Text=t;
+                end
+            end
+
             if strcmp(selectedNodes.Tag,'Projectposrois') || strcmp(selectedNodes.Tag,'Projectclassirois') || strcmp(selectedNodes.Tag,'Classifierrois')
 
                 arg=app.Tree.SelectedNodes.UserData;
@@ -6738,16 +7339,38 @@ end
                 end
 
                 try
-                    clear score_display score_updateHistogram score_updateIntensityProfile score_updateEllipticalProfile
+                    clear score score_display score_updateHistogram score_updateIntensityProfile score_updateEllipticalProfile
                     rehash
                 catch
                 end
 
-                figures=findall(0,'Type','figure');
-                appFigure=findobj(figures,'Name','ScoreApp');
-                if isprop(appFigure,'RunningAppInstance')
-                    appFigure.RunningAppInstance.addROI(roiObj);
-                else
+                openedInExistingScore = false;
+                try
+                    figures=findall(0,'Type','figure');
+                    appFigure=findobj(figures,'Name','ScoreApp');
+                    if ~isempty(appFigure) && isprop(appFigure(1),'RunningAppInstance')
+                        scoreApp = appFigure(1).RunningAppInstance;
+                        if ~isempty(scoreApp) && isvalid(scoreApp)
+                            scoreApp.addROI(roiObj);
+                            try
+                                figure(scoreApp.ScoreAppUIFigure);
+                            catch
+                            end
+                            openedInExistingScore = true;
+                        end
+                    end
+                catch ME
+                    warning('DetecDiv:OpenScore:AddROI', ...
+                        'Could not add ROI to existing Score instance: %s', ME.message);
+                    openedInExistingScore = false;
+                end
+
+                if ~openedInExistingScore
+                    try
+                        clear score
+                        rehash
+                    catch
+                    end
                     score(roiObj);
                 end
 
@@ -6782,7 +7405,7 @@ end
             if numel(proj)==0
                 return;
             end
-            name=proj.io.file;
+            name=makeSafeVariableName(proj.io.file);
             assignin('base',name,proj);
             gatherVarsFromWorkspace(app);
             displayNodes(app)
@@ -6821,7 +7444,7 @@ end
             pause(0.2);  % (garde si tu veux forcer l'update graphique)
 
             % mettre l'objet dans le workspace base sous son nom
-            name = proj.io.file;
+            name = makeSafeVariableName(proj.io.file);
             assignin('base', name, proj);
 
             % chemin absolu du .mat du projet
@@ -8278,6 +8901,12 @@ end
             app.openPipelineModuleByIndex(pipeIdx, modIdx);
         end
 
+        if strcmp(str,'ClassifierpipelineRun')
+            app.safeCloseProgressDialog(d);
+            app.openClassifierPipelineRunFolder(arg(1), arg(2));
+            return;
+        end
+
         if strcmp(str,'ProjectpipelineRun')
             d.Message = 'Preparing pipeline run editor...';
             proj = app.Data.Project{cc(1)};
@@ -8777,6 +9406,12 @@ end
             if numel(app.Tree.SelectedNodes)==0
                 return;
             end
+            if strcmp(app.Tree.SelectedNodes.Tag,'ClassifierpipelineRun')
+                arg = app.Tree.SelectedNodes.UserData;
+                app.openClassifierPipelineRunInspector(arg(1), arg(2));
+                return;
+            end
+
             if ~strcmp(app.Tree.SelectedNodes.Tag,'ProjectpipelineRun')
                 return;
             end
@@ -8784,16 +9419,13 @@ end
             projIdx = arg(1);
             runIdx = arg(2);
 
-            projVar = app.Data.Project{projIdx};
-            shallowObj = evalin('base', projVar);
-            if ~isfield(shallowObj.processing,'pipelineRun') || runIdx > numel(shallowObj.processing.pipelineRun)
-                return;
-            end
-            runObj = shallowObj.processing.pipelineRun(runIdx);
-            try
-                pipelineRunInspector(runObj, shallowObj);
-            catch ME
-                uialert(app.DetecDivUIFigure, ME.message, 'Pipeline run review error', 'Icon', 'warning');
+            [runObj, shallowObj] = app.getProjectPipelineRun(projIdx, runIdx);
+            if ~isempty(runObj)
+                try
+                    pipelineRunInspector(runObj, shallowObj);
+                catch ME
+                    uialert(app.DetecDivUIFigure, ME.message, 'Pipeline run review error', 'Icon', 'warning');
+                end
             end
         end
 
@@ -8802,6 +9434,12 @@ end
             if numel(app.Tree.SelectedNodes)==0
                 return;
             end
+            if strcmp(app.Tree.SelectedNodes.Tag,'ClassifierpipelineRun')
+                arg = app.Tree.SelectedNodes.UserData;
+                app.openClassifierPipelineRunEditor(arg(1), arg(2));
+                return;
+            end
+
             if ~strcmp(app.Tree.SelectedNodes.Tag,'ProjectpipelineRun')
                 return;
             end
@@ -8809,17 +9447,14 @@ end
             projIdx = arg(1);
             runIdx = arg(2);
 
-            projVar = app.Data.Project{projIdx};
-            shallowObj = evalin('base', projVar);
-            if ~isfield(shallowObj.processing,'pipelineRun') || runIdx > numel(shallowObj.processing.pipelineRun)
-                return;
-            end
-            runObj = shallowObj.processing.pipelineRun(runIdx);
-            try
-                app.openPipelineEditorWithProgress(shallowObj, runObj, 'Opening run for editing...', 'EditExistingRun', true);
-                RefreshtreewindowMenuSelected(app, []);
-            catch ME
-                uialert(app.DetecDivUIFigure, ME.message, 'Pipeline run editor error', 'Icon', 'warning');
+            [runObj, shallowObj] = app.getProjectPipelineRun(projIdx, runIdx);
+            if ~isempty(runObj)
+                try
+                    app.openPipelineEditorWithProgress(shallowObj, runObj, 'Opening run for editing...', 'EditExistingRun', true);
+                    RefreshtreewindowMenuSelected(app, []);
+                catch ME
+                    uialert(app.DetecDivUIFigure, ME.message, 'Pipeline run editor error', 'Icon', 'warning');
+                end
             end
         end
 
@@ -8873,6 +9508,95 @@ end
                 return;
             end
             runObj = shallowObj.processing.pipelineRun(runIdx);
+        end
+
+        function [runObj, clas] = getClassifierPipelineRun(app, classifierIdx, runIdx)
+            runObj = [];
+            clas = [];
+            if classifierIdx > numel(app.Data.Classifier)
+                return;
+            end
+            try
+                clas = evalin('base', app.Data.Classifier{classifierIdx});
+            catch
+                clas = [];
+            end
+            runPath = '';
+            try
+                if isfield(app.Data,'ClassifierpipelineRunPath') && classifierIdx <= numel(app.Data.ClassifierpipelineRunPath) && ...
+                        runIdx <= numel(app.Data.ClassifierpipelineRunPath{classifierIdx})
+                    runPath = char(string(app.Data.ClassifierpipelineRunPath{classifierIdx}{runIdx}));
+                end
+            catch
+                runPath = '';
+            end
+            if isempty(runPath) || exist(runPath, 'dir') ~= 7
+                return;
+            end
+            try
+                [runObj, ~] = pipelineRunLoad(runPath);
+            catch
+                runObj = [];
+            end
+        end
+
+        function openClassifierPipelineRunInspector(app, classifierIdx, runIdx)
+            [runObj, clas] = app.getClassifierPipelineRun(classifierIdx, runIdx);
+            if isempty(runObj)
+                return;
+            end
+            try
+                pipelineRunInspector(runObj, clas);
+            catch ME
+                uialert(app.DetecDivUIFigure, ME.message, 'Pipeline run review error', 'Icon', 'warning');
+            end
+        end
+
+        function openClassifierPipelineRunEditor(app, classifierIdx, runIdx)
+            [runObj, ~] = app.getClassifierPipelineRun(classifierIdx, runIdx);
+            if isempty(runObj)
+                return;
+            end
+            try
+                app.openPipelineEditorWithProgress([], runObj, 'Opening classifier run for editing...', 'EditExistingRun', true);
+                RefreshtreewindowMenuSelected(app, []);
+            catch ME
+                uialert(app.DetecDivUIFigure, ME.message, 'Pipeline run editor error', 'Icon', 'warning');
+            end
+        end
+
+        function openClassifierPipelineRunLog(app, classifierIdx, runIdx)
+            try
+                runObj = app.getClassifierPipelineRun(classifierIdx, runIdx);
+                if isempty(runObj)
+                    return;
+                end
+                [runPath, ~] = runObj.getPath;
+                logFile = fullfile(runPath, 'run_log.txt');
+                if exist(logFile, 'file') ~= 2
+                    pipelineRunSave(runObj);
+                end
+                showPipelineRunTextFile(app, runObj, logFile, 'Pipeline run log');
+            catch ME
+                uialert(app.DetecDivUIFigure, ME.message, 'Open run log', 'Icon', 'error');
+            end
+        end
+
+        function openClassifierPipelineRunFolder(app, classifierIdx, runIdx)
+            try
+                runObj = app.getClassifierPipelineRun(classifierIdx, runIdx);
+                if isempty(runObj)
+                    return;
+                end
+                [runPath, ~] = runObj.getPath;
+                if isempty(runPath) || exist(runPath, 'dir') ~= 7
+                    uialert(app.DetecDivUIFigure, 'Run folder does not exist yet.', 'Open run folder', 'Icon', 'warning');
+                    return;
+                end
+                openPathInSystem(app, runPath);
+            catch ME
+                uialert(app.DetecDivUIFigure, ME.message, 'Open run folder', 'Icon', 'error');
+            end
         end
 
         function showPipelineRunTextFile(app, runObj, filePath, titleText)

@@ -35,6 +35,12 @@ cltmp=classif.roi;
 warning off all
 
 channel=classif.channelName;
+isDeepLabSemantic = false;
+try
+    isDeepLabSemantic = isprop(classif, 'classifierPkg') && ...
+        strcmpi(char(string(classif.classifierPkg)), 'deeplab_pixel_classification');
+catch
+end
 
 for i=1:numel(rois)
 
@@ -43,10 +49,34 @@ for i=1:numel(rois)
     % find image channel associated with training
     %pixe = strfind(cltmp(i).display.channel, classif.strid);
 
+    if isDeepLabSemantic
+        try
+            deeplab_pixel_classification.migrateAnnotationChannels(cltmp(rois(i)), classif, 'RemoveLegacy', false);
+        catch ME
+            warning('formatPixelTrainingSet:DeepLabAnnotationMigration', ...
+                'Could not migrate legacy DeepLab annotation channels for ROI %s: %s', ...
+                char(string(cltmp(rois(i)).id)), ME.message);
+        end
+    end
+
     if strcmp(classif.description{1},'Image pixel regression')
     cc=cltmp(rois(i)).findChannelID(channel{2}); % second channel is used as output
     else
     cc=cltmp(rois(i)).findChannelID(classif.strid); % classical labeled channel
+    end
+
+    if numel(cc) == 0
+        cltmp(rois(i)).load;
+        if strcmp(classif.description{1},'Image pixel regression')
+            cc=cltmp(rois(i)).findChannelID(channel{2});
+        else
+            cc=cltmp(rois(i)).findChannelID(classif.strid);
+        end
+    end
+
+    if numel(cc) == 0
+        disp(['Processing ROI: ' num2str(rois(i)) ' ... Annotation channel not found, skipped.']);
+        continue;
     end
 
     
@@ -76,8 +106,17 @@ for i=1:numel(rois)
         %             pix=[pix cltmp(i).findChannelID(channel{j})];
         %         end
 
-        % pix=find(cltmp(rois(i)).channelid==classif.channel(1)); % find channel
-        im=cltmp(rois(i)).image(:,:,pix,:);
+        maxChannelNeeded = max([pix(:); cc(:)]);
+        if maxChannelNeeded > size(cltmp(rois(i)).image, 3)
+            cltmp(rois(i)).image = [];
+            cltmp(rois(i)).load;
+        end
+
+        if maxChannelNeeded > size(cltmp(rois(i)).image, 3)
+            warning('Skipping ROI %s: requested channel index %d exceeds loaded image channel count %d.', ...
+                char(string(cltmp(rois(i)).id)), maxChannelNeeded, size(cltmp(rois(i)).image, 3));
+            continue;
+        end
 
         %         if numel(pix)==1
         %             % 'ok'
@@ -90,6 +129,13 @@ for i=1:numel(rois)
         %pixcc=find(cltmp(i).channelid==cc)
 
         lab=cltmp(rois(i)).image(:,:,cc,:);
+        if isDeepLabSemantic && ~any(lab(:) > 0)
+            disp(['Processing ROI: ' num2str(rois(i)) ' ... No annotated frame, skipped.']);
+            continue;
+        end
+
+        % pix=find(cltmp(rois(i)).channelid==classif.channel(1)); % find channel
+        im=cltmp(rois(i)).image(:,:,pix,:);
 
         if strcmp(classif.description{3},'Solov2') % classical labeled image
             %resize images to multile of 32 in case of solov2
@@ -108,6 +154,30 @@ for i=1:numel(rois)
 
         if strcmp(classif.description{1},'Image pixel regression')
          %   labels=repmat(lab,1,1,3,1);
+        elseif isDeepLabSemantic
+            labels = double(zeros(size(lab,1), size(lab,2), 3, size(lab,4)));
+            nClasses = numel(classif.classes);
+            maxLabel = double(max(lab(:)));
+            if nClasses == 2 && maxLabel > nClasses
+                classMask = cell(1, nClasses);
+                classMask{1} = lab(:,:,1,:) == 0;
+                classMask{2} = lab(:,:,1,:) > 0;
+            else
+                classMask = cell(1, nClasses);
+                for jj = 1:nClasses
+                    if jj == 1
+                        classMask{jj} = lab(:,:,1,:) == 0 | lab(:,:,1,:) == 1;
+                    else
+                        classMask{jj} = lab(:,:,1,:) == jj;
+                    end
+                end
+            end
+            for jj = 1:nClasses
+                colorRow = min(jj + 1, size(classif.colormap, 1));
+                for k = 1:3
+                    labels(:,:,k,:) = labels(:,:,k,:) + double(classMask{jj}) * classif.colormap(colorRow,k);
+                end
+            end
         else
             labels= double(zeros(size(lab,1),size(lab,2),3,size(lab,4)));
 
@@ -129,6 +199,21 @@ for i=1:numel(rois)
     reverseStr = '';
 
     for j=1:size(im,4) %time
+        if strcmp(classif.description{1},'Image pixel regression')
+            tmplab = [];
+            hasLabeledPixels = true;
+        else
+            tmplab=lab(:,:,:,j);
+            hasLabeledPixels = max(tmplab(:)) > 1;
+            if isDeepLabSemantic
+                hasLabeledPixels = any(tmplab(:) > 0);
+            end
+        end
+
+        if ~hasLabeledPixels && ~strcmp(classif.description{3},'Solov2')
+            continue;
+        end
+
         tmp=im(:,:,:,j);
 
         
@@ -177,16 +262,9 @@ for i=1:numel(rois)
 
         if numel(cc)>0
 
-            if strcmp(classif.description{1},'Image pixel regression')
-                % do nothing
-            else
-            tmplab=lab(:,:,:,j);
-            end
-
             if ~strcmp(classif.description{3},'Solov2') % classical labeled image
 
-                %max(tmplab(:))
-                if max(tmplab(:))>1 | strcmp(classif.description{1},'Image pixel regression') % image has labeled pixels or is a regression
+                if hasLabeledPixels | strcmp(classif.description{1},'Image pixel regression') % image has labeled pixels or is a regression
 
                     if numel(pix)<=3
                        
@@ -201,9 +279,9 @@ for i=1:numel(rois)
                     else
                     imwrite(labels(:,:,:,j),[classif.path '/' foldername '/labels/' cltmp(rois(i)).id '_frame_' tr '.tif']); % labeled image
                     end
+                    output=output+1;
 
                 end
-                output=output+1;
 
             else % solov2 model + data augmentation
 

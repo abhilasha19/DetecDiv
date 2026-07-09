@@ -227,6 +227,7 @@ function [ctx, report] = runPipelineStructured(pipe, ctx)
     stashRunReport(report);
     pipelineRunEvent(ctx, 'run_done', 'Summary', report.summary, ...
         'StartedAt', report.startedAt, 'EndedAt', report.endedAt);
+    detecdiv_emit_workspace_changed(ctx, report, 'done', 'runPipelineStructured');
 end
 
 function ctx = preparePythonEnvironmentIfNeeded(pipe, ctx)
@@ -1033,6 +1034,7 @@ function ctx = executeNode(node, ctx)
         case 'dataloader'
             try
                 ctx = dataLoader.process(ctx);
+                ctx = markDataloaderFovSelectionApplied(ctx);
             catch ME
                 throwNodeFailed(node, ME);
             end
@@ -1087,6 +1089,49 @@ function ctx = executeNode(node, ctx)
 
     % optional output coherence check
     ctx = ensureOutputs(node, ctx);
+end
+
+function ctx = markDataloaderFovSelectionApplied(ctx)
+    if ~isstruct(ctx)
+        return;
+    end
+
+    useExistingProjectSources = false;
+    try
+        if isfield(ctx,'dataLoader') && isstruct(ctx.dataLoader) && ...
+                isfield(ctx.dataLoader,'useExistingProjectSources') && ~isempty(ctx.dataLoader.useExistingProjectSources)
+            useExistingProjectSources = logical(ctx.dataLoader.useExistingProjectSources);
+        end
+    catch
+        useExistingProjectSources = false;
+    end
+    if useExistingProjectSources
+        return;
+    end
+
+    appliedFovs = [];
+    try
+        if isfield(ctx,'dataLoader') && isstruct(ctx.dataLoader) && ...
+                isfield(ctx.dataLoader,'positionIdx') && ~isempty(ctx.dataLoader.positionIdx)
+            appliedFovs = normalizeIndexVectorLocal(ctx.dataLoader.positionIdx);
+        elseif isfield(ctx,'positionIdx') && ~isempty(ctx.positionIdx)
+            appliedFovs = normalizeIndexVectorLocal(ctx.positionIdx);
+        end
+    catch
+        appliedFovs = [];
+    end
+    if isempty(appliedFovs)
+        return;
+    end
+
+    if ~isfield(ctx,'sel') || ~isstruct(ctx.sel) || isempty(ctx.sel)
+        ctx.sel = struct();
+    end
+    ctx.sel.sourceFovs = appliedFovs;
+    ctx.sel.fovs = [];
+    if isfield(ctx,'run') && isstruct(ctx.run)
+        ctx.run.sourceFovIndex = appliedFovs;
+    end
 end
 
 function msg = formatNodeError(ME)
@@ -1232,9 +1277,9 @@ function p = getRuntimeNodeParams(ctx, node, paramField)
 p = getfielddefault(node, 'params', struct());
 try
     if isstruct(ctx) && isfield(ctx, paramField) && isstruct(ctx.(paramField))
-        p = ctx.(paramField);
+        p = mergeStruct(p, ctx.(paramField));
     elseif isstruct(ctx) && isfield(ctx, 'params') && isstruct(ctx.params)
-        p = ctx.params;
+        p = mergeStruct(p, ctx.params);
     end
 catch
     p = getfielddefault(node, 'params', struct());
@@ -1440,6 +1485,9 @@ function [missing, deferred] = missingParamsForNode(node, ctx, mode)
     for i = 1:numel(req)
         k = char(string(req{i}));
         scope = paramScopeForNode(node, k);
+        if strcmpi(k, 'path') && strcmpi(char(string(getfielddefault(node, 'type', ''))), 'classifier')
+            continue;
+        end
         if isfield(p,k) && ~isempty(p.(k))
             continue;
         end
@@ -1693,6 +1741,9 @@ function ctx = executeProcessorNode(node, ctx)
     procCtx.sel = getfielddefault(ctx, 'sel', struct());
     procCtx.pipeline = getfielddefault(ctx, 'pipeline', struct());
     procCtx.io = getfielddefault(ctx, 'io', struct());
+    procCtx.io.requiredChannels = mergeChannelLists( ...
+        getfielddefault(procCtx.io, 'requiredChannels', {}), ...
+        requiredProcessorChannelsForNode(pkgName, p));
     procCtx.store = getfielddefault(ctx, 'store', struct());
     procCtx.executionPolicy = getfielddefault(ctx, 'executionPolicy', struct());
     explicitProcessorOutputName = resolveExplicitNodeOutputName(node, p);
@@ -1953,12 +2004,11 @@ end
 
 function ctx = executeClassifierNode(node, ctx)
     shallowObj = getShallowObject(ctx);
-    if isempty(shallowObj)
-        error('runPipeline:ClassifierNoProject', ...
-            'Classifier node %s requires a shallow project context.', char(string(node.id)));
-    end
-
     rois = selectRoisForNode(ctx, node);
+    if isempty(shallowObj) && isempty(rois)
+        error('runPipeline:ClassifierNoInput', ...
+            'Classifier node %s requires either a shallow project context or explicit ROI input.', char(string(node.id)));
+    end
     if isempty(rois)
         warning('runPipeline:ClassifierNoROI', ...
             'Classifier node %s has no ROI to classify; skipping.', char(string(node.id)));
@@ -1967,6 +2017,7 @@ function ctx = executeClassifierNode(node, ctx)
 
     pkgName = resolveNodePackage(node);
     p = getRuntimeNodeParams(ctx, node, 'classifier');
+    intent = classifierRunIntent(ctx, p);
     refClassi = resolveClassifierReference(node, p, ctx);
     clsObj = classi('', 'pipeline_classifier', randi(1e9), 'InitTraining', false);
     clsObj.strid = char(string(node.id));
@@ -2018,8 +2069,38 @@ function ctx = executeClassifierNode(node, ctx)
         clsObj.runProfiles.classify = struct( ...
             'io', getfielddefault(ctx, 'io', struct()), ...
             'store', getfielddefault(ctx, 'store', struct()), ...
-            'cancel', getfielddefault(ctx, 'cancel', struct()));
+            'cancel', getfielddefault(ctx, 'cancel', struct()), ...
+            'progress', getfielddefault(ctx, 'progress', struct()), ...
+            'params', p);
+        clsObj.runProfiles.train = struct( ...
+            'io', getfielddefault(ctx, 'io', struct()), ...
+            'store', getfielddefault(ctx, 'store', struct()), ...
+            'cancel', getfielddefault(ctx, 'cancel', struct()), ...
+            'progress', getfielddefault(ctx, 'progress', struct()), ...
+            'run', getfielddefault(ctx, 'run', struct()), ...
+            'pipeline', getfielddefault(ctx, 'run', struct()), ...
+            'params', p);
     catch
+    end
+
+    if strcmp(intent, 'train')
+        try
+            clsObj.roi = rois;
+            clsObj.trainingset = 1:numel(rois);
+            if isprop(clsObj, 'dataset')
+                clsObj.dataset = struct('classes', {clsObj.classes}, 'channels', {{}}, ...
+                    'split', struct('train', 1:numel(rois), 'val', [], 'test', []));
+            end
+            checkPipelineCancellation(ctx, 'before_classifier_training', char(string(node.id)));
+            clsObj.trainClassifier;
+        catch ME
+            throwNodeFailed(node, ME);
+        end
+        ctx.roiList = rois;
+        ctx.dataSeries = collectDataSeriesFromRois(rois);
+        ctx.channels = inferChannelsFromRois(rois, ctx);
+        ctx.masks = inferMaskChannelsFromRois(rois);
+        return;
     end
 
     outputName = char(string(node.id));
@@ -2153,6 +2234,46 @@ for i = 1:numel(props)
         end
     catch
     end
+end
+end
+
+function intent = classifierRunIntent(ctx, p)
+intent = 'infer';
+try
+    if isstruct(p)
+        if isfield(p, 'operation') && ~isempty(p.operation)
+            intent = normalizeClassifierIntent(p.operation);
+            return;
+        elseif isfield(p, 'intent') && ~isempty(p.intent)
+            intent = normalizeClassifierIntent(p.intent);
+            return;
+        end
+    end
+catch
+end
+try
+    if isfield(ctx, 'run') && isstruct(ctx.run)
+        if isfield(ctx.run, 'classifierIntent') && ~isempty(ctx.run.classifierIntent)
+            intent = normalizeClassifierIntent(ctx.run.classifierIntent);
+            return;
+        elseif isfield(ctx.run, 'intent') && ~isempty(ctx.run.intent)
+            intent = normalizeClassifierIntent(ctx.run.intent);
+            return;
+        end
+    end
+catch
+end
+end
+
+function intent = normalizeClassifierIntent(value)
+txt = lower(strtrim(char(string(value))));
+switch txt
+    case {'train','training','fit'}
+        intent = 'train';
+    case {'validate','validation','val','test','evaluate','eval'}
+        intent = 'validate';
+    otherwise
+        intent = 'infer';
 end
 end
 
@@ -2382,7 +2503,13 @@ if ~isstruct(refInfo) || ~isfield(refInfo,'modulePath') || isempty(refInfo.modul
     return;
 end
 modulePath = char(string(refInfo.modulePath));
-if ~ispc && looksLikeWindowsAbsPath(modulePath)
+if ispc && startsWith(strrep(modulePath, '\', '/'), '/')
+    [mappedPath, mapped] = mapModulePathToLocalPath(modulePath, ctx);
+    if mapped && (exist(mappedPath, 'dir') == 7 || exist(mappedPath, 'file') == 2)
+        refInfo.modulePath = mappedPath;
+        return;
+    end
+elseif ~ispc && looksLikeWindowsAbsPath(modulePath)
     [mappedPath, mapped] = mapModulePathToServerPath(modulePath, ctx);
     if mapped && (exist(mappedPath, 'dir') == 7 || exist(mappedPath, 'file') == 2)
         refInfo.modulePath = mappedPath;
@@ -2459,6 +2586,10 @@ end
 
 function [mappedPath, mapped] = mapModulePathToServerPath(pathIn, ctx)
     [mappedPath, mapped] = detecdiv_paths_map_module_path(pathIn, ctx, 'server');
+end
+
+function [mappedPath, mapped] = mapModulePathToLocalPath(pathIn, ctx)
+    [mappedPath, mapped] = detecdiv_paths_map_module_path(pathIn, ctx, 'local');
 end
 
 function mappings = modulePathMappings(ctx)
@@ -2613,6 +2744,7 @@ function rois = selectRoisForNode(ctx, node)
             rois = rois([]);
         end
     end
+    rois = normalizeRoiPathsForExecution(rois, ctx);
 end
 
 function rois = collectRoisFromFovList(fovList)
@@ -2671,6 +2803,25 @@ function rois = filterValidRoiHandles(rois)
         end
     end
     rois = rois(keep);
+end
+
+function rois = normalizeRoiPathsForExecution(rois, ctx)
+if isempty(rois)
+    return;
+end
+for i = 1:numel(rois)
+    try
+        if ~isprop(rois(i), 'path') || isempty(rois(i).path)
+            continue;
+        end
+        currentPath = char(string(rois(i).path));
+        [mappedPath, mapped] = mapModulePathToServerPath(currentPath, ctx);
+        if mapped && ~isempty(mappedPath)
+            rois(i).path = mappedPath;
+        end
+    catch
+    end
+end
 end
 
 function pkgName = resolveNodePackage(node)
@@ -2793,6 +2944,79 @@ function pkgName = canonicalPackageNameForNode(nodeType, pkgName)
                 pkgName = raw;
             end
     end
+end
+
+function channels = requiredProcessorChannelsForNode(pkgName, params)
+channels = {};
+if isempty(pkgName) || ~isstruct(params)
+    return;
+end
+switch lower(strtrim(char(string(pkgName))))
+    case 'computemetrics'
+        channels = collectIndexedChannelParams(params, 'channel', '_name', channels);
+        channels = collectIndexedChannelParams(params, 'mask', '_name', channels);
+end
+channels = mergeChannelLists({}, channels);
+end
+
+function channels = collectIndexedChannelParams(params, prefix, suffix, channels)
+if nargin < 4 || isempty(channels)
+    channels = {};
+end
+names = fieldnames(params);
+expr = ['^' regexptranslate('escape', prefix) '\d+' regexptranslate('escape', suffix) '$'];
+for i = 1:numel(names)
+    key = names{i};
+    if isempty(regexp(key, expr, 'once'))
+        continue;
+    end
+    channels = mergeChannelLists(channels, params.(key));
+end
+end
+
+function out = mergeChannelLists(varargin)
+out = {};
+for i = 1:nargin
+    out = [out normalizeChannelList(varargin{i})]; %#ok<AGROW>
+end
+if isempty(out)
+    return;
+end
+out = unique(out(~cellfun(@isempty, out)), 'stable');
+end
+
+function channels = normalizeChannelList(value)
+channels = {};
+if isempty(value)
+    return;
+end
+if iscell(value)
+    for i = 1:numel(value)
+        channels = [channels normalizeChannelList(value{i})]; %#ok<AGROW>
+    end
+    return;
+end
+if isstring(value)
+    value = cellstr(value(:));
+    channels = normalizeChannelList(value);
+    return;
+end
+if ischar(value)
+    parts = regexp(value, '[,;]', 'split');
+else
+    try
+        parts = cellstr(string(value(:)));
+    catch
+        parts = {};
+    end
+end
+for i = 1:numel(parts)
+    s = strtrim(char(string(parts{i})));
+    if isempty(s) || startsWith(s, '<') || any(strcmpi(s, {'none','auto','n/a','na','<all>'}))
+        continue;
+    end
+    channels{end+1} = s; %#ok<AGROW>
+end
 end
 
 function vals = normalizeIndexVectorLocal(vals)

@@ -31,7 +31,7 @@ switch mode
             tileIndex = 1;
           %  set(graphicsHandles.imgHandles(tileIndex), 'CData', displayImage);
 
-            h = graphicsHandles.imgHandles(tileIndex);
+            h = localImageHandle(graphicsHandles.imgHandles(tileIndex));
             if ~isequal(get(h, 'CData'), displayImage)
                 set(h, 'CData', displayImage);
             end
@@ -39,7 +39,9 @@ switch mode
             h = graphicsHandles.overlayHandles(tileIndex);
             if ~isequal(get(h, 'CData'), indexedOverlay)
                 set(h, 'CData', indexedOverlay);
-                 set(h, 'AlphaData', alphaOverlay, 'AlphaDataMapping', 'none');
+            end
+            if ~isequal(get(h, 'AlphaData'), alphaOverlay)
+                set(h, 'AlphaData', alphaOverlay, 'AlphaDataMapping', 'none');
             end
 
 
@@ -54,11 +56,13 @@ switch mode
                 newImg = displayImage(:,:,:,ch);
                 %  aa= graphicsHandles.imgHandles(tileIndex);
                 %  tmp=graphicsHandles.imgHandles(tileIndex)
-                set(graphicsHandles.imgHandles(tileIndex), 'CData', newImg);
+                h = localImageHandle(graphicsHandles.imgHandles(tileIndex));
+                set(h, 'CData', newImg);
 
 
                 set(graphicsHandles.overlayHandles(tileIndex),'CData', indexedOverlay);
                 set(graphicsHandles.overlayHandles(tileIndex), 'AlphaData', alphaOverlay, 'AlphaDataMapping', 'none');
+                localRefreshScaleBar(graphicsHandles, tileIndex, h.Parent, layoutOptions, ch);
             end
         end
 
@@ -147,15 +151,18 @@ switch mode
                     %compositeImg = squeeze(max(roiData.image, [], 3));
 
                     if isKey(graphicsHandles.imgHandles, tileIndex)
-                        set(graphicsHandles.imgHandles(tileIndex), 'CData', displayImage);
+                        h = localImageHandle(graphicsHandles.imgHandles(tileIndex));
+                        set(h, 'CData', displayImage);
                     end
 
                     if isKey(graphicsHandles.imgHandles, tileIndex)
-                        set(graphicsHandles.imgHandles(tileIndex), 'CData', displayImage(:,:,:,1));
-                        ax=graphicsHandles.imgHandles(tileIndex); ax=ax.Parent;
+                        h = localImageHandle(graphicsHandles.imgHandles(tileIndex));
+                        set(h, 'CData', displayImage(:,:,:,1));
+                        ax=h.Parent;
 
                         [htext, hvector]=score_displayVectorGraphics(ax, newframe, 1, vContours , layoutOptions);
                         graphicsHandles.vectorHandles(tileIndex)=[htext hvector];
+                        score_drawMovieEventText(ax, layoutOptions, localMovieFrameValue(layoutOptions, newframe));
                     end
 
                 else
@@ -168,11 +175,16 @@ switch mode
                         tileIndex = (global_row-1)*displayHandles.MasterCols + global_col;
 
                         if isKey(graphicsHandles.imgHandles, tileIndex)
-                            set(graphicsHandles.imgHandles(tileIndex), 'CData', displayImage(:,:,:,ch));
-                            ax=graphicsHandles.imgHandles(tileIndex); ax=ax.Parent;
+                            h = localImageHandle(graphicsHandles.imgHandles(tileIndex));
+                            set(h, 'CData', displayImage(:,:,:,ch));
+                            ax=h.Parent;
+                            localRefreshScaleBar(graphicsHandles, tileIndex, ax, layoutOptions, ch);
 
                             [htext, hvector]=score_displayVectorGraphics(ax, newframe, ch, vContours , layoutOptions);
                             graphicsHandles.vectorHandles(tileIndex)=[htext hvector];
+                            if ch == 1
+                                score_drawMovieEventText(ax, layoutOptions, localMovieFrameValue(layoutOptions, newframe));
+                            end
                         end
 
                     end
@@ -296,6 +308,91 @@ catch ME
    % warning('Lineage refresh failed: %s', ME.message);
 end
 
+if strcmp(mode, 'display')
+    score_syncOverlayAxes(graphicsHandles);
+end
+
+end
+
+function [xlims, doClip] = localMovieXLimits(layoutOptions)
+xlims = [];
+doClip = false;
+try
+    if ~isfield(layoutOptions, 'mode') || ~strcmpi(string(layoutOptions.mode), "movie") || ...
+            ~isfield(layoutOptions, 'frames') || isempty(layoutOptions.frames) || ...
+            ~isfield(layoutOptions, 'framerate') || isempty(layoutOptions.framerate)
+        return;
+    end
+    frames = double(layoutOptions.frames(:)');
+    framerate = double(layoutOptions.framerate);
+    if ~isfinite(framerate) || framerate <= 0 || isempty(frames)
+        return;
+    end
+    if isfield(layoutOptions, 'timeOffset') && layoutOptions.timeOffset
+        xlims = [0, (max(frames) - min(frames)) * framerate];
+    else
+        xlims = [min(frames), max(frames)] * framerate;
+    end
+    if xlims(2) <= xlims(1)
+        xlims(2) = xlims(1) + framerate;
+    end
+    doClip = all(isfinite(xlims));
+catch
+    xlims = [];
+    doClip = false;
+end
+end
+
+function h = localImageHandle(hIn)
+h = hIn;
+if numel(h) > 1
+    isImg = arrayfun(@(x) isgraphics(x) && isa(x, 'matlab.graphics.primitive.Image'), h);
+    h = h(find(isImg, 1, 'first'));
+end
+if isempty(h) || ~isgraphics(h) || ~isa(h, 'matlab.graphics.primitive.Image')
+    error('score_updateRender:InvalidImageHandle', ...
+        'Stored image handle is not a matlab.graphics.primitive.Image.');
+end
+end
+
+function localRefreshScaleBar(graphicsHandles, tileIndex, ax, layoutOptions, ch)
+if isempty(graphicsHandles) || ~isfield(graphicsHandles, 'scaleBarHandles') || ...
+        isempty(graphicsHandles.scaleBarHandles) || isempty(ax) || ~isgraphics(ax)
+    return;
+end
+
+if isfield(graphicsHandles, 'overlayHandles') && ~isempty(graphicsHandles.overlayHandles) && ...
+        isKey(graphicsHandles.overlayHandles, tileIndex)
+    overlayHandle = graphicsHandles.overlayHandles(tileIndex);
+    if ~isempty(overlayHandle) && isgraphics(overlayHandle)
+        ax = overlayHandle(1).Parent;
+    end
+end
+
+if isKey(graphicsHandles.scaleBarHandles, tileIndex)
+    oldHandles = graphicsHandles.scaleBarHandles(tileIndex);
+    if ~isempty(oldHandles)
+        delete(oldHandles(isgraphics(oldHandles)));
+    end
+    remove(graphicsHandles.scaleBarHandles, tileIndex);
+end
+
+newHandles = score_drawChannelScaleBar(ax, layoutOptions, ch);
+if ~isempty(newHandles)
+    graphicsHandles.scaleBarHandles(tileIndex) = newHandles;
+end
+end
+
+function frameValue = localMovieFrameValue(layoutOptions, newframe)
+frameValue = newframe;
+try
+    if isfield(layoutOptions, 'frames') && ~isempty(layoutOptions.frames) && ...
+            newframe >= 1 && newframe <= numel(layoutOptions.frames)
+        frameValue = layoutOptions.frames(newframe);
+    end
+catch
+    frameValue = newframe;
+end
 end
 
 function updateMarkers(hLineAll, fIdx, layoutOptions)
@@ -415,6 +512,15 @@ else
     currentframe_rel = currentframe;
 end
 
+[movieXLim, clipToMovie] = localMovieXLimits(layoutOptions);
+if clipToMovie
+    keepMovie = xdata >= movieXLim(1) & xdata <= movieXLim(2);
+    if any(keepMovie)
+        xdata = xdata(keepMovie);
+        ydata = ydata(keepMovie, :);
+    end
+end
+
 % ------------------------------------------------------------
 % 1) Mettre à jour uniquement les "vraies" lignes (pas les markers)
 % ------------------------------------------------------------
@@ -445,11 +551,22 @@ if ~isempty(markerIdx) && ~isempty(layoutOptions.frames)
             fRel = fIdx;
         end
 
-        if fRel >= 1 && fRel <= size(ydata,1)
+        markerIdxInData = [];
+        if clipToMovie
+            [~, markerIdxInData] = min(abs(xdata - xMarker));
+            if isempty(markerIdxInData) || abs(xdata(markerIdxInData) - xMarker) > max(eps, 0.5 * layoutOptions.framerate)
+                markerIdxInData = [];
+            end
+        elseif fRel >= 1 && fRel <= size(ydata,1)
+            markerIdxInData = fRel;
+        end
+
+        if ~isempty(markerIdxInData)
             for j = 1:nLines
                 if cc <= numel(markerIdx)
                     hm = hLineAll(markerIdx(cc));
-                    set(hm, 'XData', xMarker, 'YData', ydata(fRel, j));
+                    set(hm, 'XData', xMarker, 'YData', ydata(markerIdxInData, j), ...
+                        'MarkerSize', max(4, floor(0.6 * layoutOptions.fontSize)));
                     cc = cc + 1;
                 end
             end
@@ -480,6 +597,15 @@ if isgraphics(hLineAll(1)) && isa(hLineAll(1), 'matlab.graphics.primitive.Image'
     Nframes = size(hLineAll(1).CData, 2);
     alphaVec = ones(1, Nframes);
 
+    if clipToMovie && ~isempty(xdata)
+        if layoutOptions.timeOffset
+            currentX = (currentframe - layoutOptions.frames(1)) * layoutOptions.framerate;
+        else
+            currentX = currentframe * layoutOptions.framerate;
+        end
+        [~, currentframe_rel] = min(abs(xdata - currentX));
+    end
+
     if currentframe_rel <= Nframes
         alphaVec(currentframe_rel:end) = 0.2;
     end
@@ -491,7 +617,10 @@ else
     % Mode courbes: tracking XLim
     framerate = layoutOptions.framerate;
 
-    if isfield(layoutOptions, 'track') && layoutOptions.track && ~strcmpi(layoutOptions.mode, 'sequence')
+    if clipToMovie
+        aMin = movieXLim(1);
+        aMax = movieXLim(2);
+    elseif isfield(layoutOptions, 'track') && layoutOptions.track && ~strcmpi(layoutOptions.mode, 'sequence')
         aMin = (currentframe_rel - layoutOptions.trackWindow) * framerate;
         aMax = (currentframe_rel + layoutOptions.trackWindow) * framerate;
     else

@@ -28,6 +28,7 @@ graphicsHandles.lineHandles    = containers.Map('KeyType','double','ValueType','
 graphicsHandles.overlayHandles = containers.Map('KeyType','double','ValueType','any');
 graphicsHandles.vectorHandles = containers.Map('KeyType','double','ValueType','any');
 graphicsHandles.textHandles = containers.Map('KeyType','double','ValueType','any');
+graphicsHandles.scaleBarHandles = containers.Map('KeyType','double','ValueType','any');
 
 
 graphicsHandles.lineageHandles = containers.Map('KeyType','double','ValueType','any');
@@ -78,7 +79,7 @@ switch lower(displayHandles.mode)
                         tileIndex = (global_row-1)*displayHandles.MasterCols + global_col;
                         ax = nexttile(masterTL, tileIndex, [layoutOptions.Nbrick, layoutOptions.Nbrick]);
 
-                        imshow(displayImage, []);
+                        hImg = imshow(displayImage, []);
 
                         [htext, hvector]=score_displayVectorGraphics(ax, frame, 1, vContours , layoutOptions);
 
@@ -87,7 +88,7 @@ switch lower(displayHandles.mode)
                         graphicsHandles.vectorHandles(tileIndex)=[htext hvector];
 
                         %   title(sprintf('ROI(%d) F:%d', roiIndex, frame));
-                        graphicsHandles.imgHandles(tileIndex) = ax.Children;
+                        graphicsHandles.imgHandles(tileIndex) = hImg;
 
                         if frame==1 && layoutOptions.ROITitle
                                 title(ax,roiData.id,'Color',textColor,'Interpreter','none','FontSize', floor(sqrt(scalingFactor)*fontsize));
@@ -110,14 +111,20 @@ switch lower(displayHandles.mode)
                             ax = nexttile(masterTL, tileIndex, [layoutOptions.Nbrick, layoutOptions.Nbrick]);
 
                             %  img = roiData.image(:,:,ch,frame);
-                            imshow(displayImage(:,:,:,ch), []);
+                            hImg = imshow(displayImage(:,:,:,ch), []);
                             [htext, hvector]=score_displayVectorGraphics(ax, frame, ch, vContours , layoutOptions);
+                            if frame == numel(layoutOptions.frames)
+                                hScale = score_drawChannelScaleBar(ax, layoutOptions, ch);
+                                if ~isempty(hScale)
+                                    graphicsHandles.scaleBarHandles(tileIndex) = hScale;
+                                end
+                            end
                             drawSeparationLines(ax,layoutOptions);
                             graphicsHandles.vectorHandles(tileIndex)=[htext hvector];
                             %  title(sprintf('ROI(%d) Ch:%d F:%d', roiIndex, ch, frame));
-                            graphicsHandles.imgHandles(tileIndex) = ax.Children;
+                            graphicsHandles.imgHandles(tileIndex) = hImg;
                             if frame == 1
-                                ylabel(ax, layoutOptions.channel{ch}, 'FontName', 'Arial', ...
+                                ylabel(ax, score_wrapDisplayLabel(localChannelLabel_(layoutOptions, ch)), 'FontName', 'Arial', ...
                                     'FontSize', floor(sqrt(scalingFactor)*fontsize), 'Color', textColor,'Interpreter','none');
                             end
 
@@ -233,9 +240,9 @@ newPath = fullfile(folder, [name '.pdf']);
             set(ax, 'HitTest', 'off');
             axarray=[axarray ax];
             %compositeImg = max(roiData.image, [], 3);
-            imshow(displayImage, []);
+            hImg = imshow(displayImage, []);
             %  title('Overlay Composite');
-            graphicsHandles.imgHandles(tileIndex) = ax.Children;
+            graphicsHandles.imgHandles(tileIndex) = hImg;
             % Ajout d'un axe overlay transparent.
             pos = get(ax, 'Position');
             axOverlay = axes('Position', pos, 'Color', 'none', 'XTick', [], 'YTick', []);
@@ -252,7 +259,7 @@ newPath = fullfile(folder, [name '.pdf']);
             set(hOverlay, 'AlphaData', alphaOverlay, 'AlphaDataMapping', 'none');
             %             axImg.UserData.OverlayHandle = hOverlay;
             %  axOverlay.UserData.CDataHandle=
-            graphicsHandles.overlayHandles(tileIndex) = axOverlay.Children;
+            graphicsHandles.overlayHandles(tileIndex) = hOverlay;
             axarray=[axarray axOverlay];
         else
             % Si overlay false, chaque canal est affiché.
@@ -265,9 +272,9 @@ newPath = fullfile(folder, [name '.pdf']);
 
                 axarray=[axarray ax];
                 img = displayImage(:,:,:,ch);
-                imshow(img, []);
+                hImg = imshow(img, []);
                 %    title(sprintf('Ch:%d', ch));
-                graphicsHandles.imgHandles(tileIndex) = ax.Children;
+                graphicsHandles.imgHandles(tileIndex) = hImg;
                 % Ajout d'un axe overlay transparent sur chaque tuile.
                 pos = get(ax, 'Position');
                 axOverlay = axes('Position', pos, 'Color', 'none', 'XTick', [], 'YTick', []);
@@ -282,8 +289,14 @@ newPath = fullfile(folder, [name '.pdf']);
                 hOverlay=imshow(indexedOverlay, 'Parent', axOverlay, 'InitialMagnification', 'fit');
                 hOverlay.Tag = 'IndexedOverlay';
                 set(hOverlay, 'AlphaData', alphaOverlay, 'AlphaDataMapping', 'none');
+                axOverlay.XLim = ax.XLim;
+                axOverlay.YLim = ax.YLim;
+                hScale = score_drawChannelScaleBar(axOverlay, layoutOptions, ch);
+                if ~isempty(hScale)
+                    graphicsHandles.scaleBarHandles(tileIndex) = hScale;
+                end
 
-                graphicsHandles.overlayHandles(tileIndex) = axOverlay.Children;
+                graphicsHandles.overlayHandles(tileIndex) = hOverlay;
                 axarray=[axarray axOverlay];
             end
 
@@ -298,6 +311,7 @@ newPath = fullfile(folder, [name '.pdf']);
         end
 
         linkaxes(axarray,'xy');
+        score_syncOverlayAxes(graphicsHandles);
 
 
 
@@ -338,9 +352,9 @@ newPath = fullfile(folder, [name '.pdf']);
                     [displayImage, vContours]=score_makeComposite(roiData,1,layoutOptions);
 
 
-                    imshow(displayImage, []);
+                    hImg = imshow(displayImage, []);
 
-titleStr = localBuildMovieRoiTitle_(layoutOptions, roiData);
+titleStr = score_wrapDisplayLabel(localBuildMovieRoiTitle_(layoutOptions, roiData), 28);
 if strlength(titleStr) > 0
     text(ax, 0.99, 0.99, titleStr, ...
         'Units','normalized', ...
@@ -351,6 +365,7 @@ if strlength(titleStr) > 0
         'Interpreter','none', ...
         'Clipping','on');
 end
+score_drawMovieEventText(ax, layoutOptions, layoutOptions.frames(1));
 
 
 
@@ -362,8 +377,7 @@ end
                     %title(sprintf('ROI(%d) Overlay', roiIndex));
 
 
-                    imageHandles = ax.Children(strcmp(get(ax.Children, 'Type'), 'image'));
-                    graphicsHandles.imgHandles(tileIndex) =  imageHandles;
+                    graphicsHandles.imgHandles(tileIndex) = hImg;
                 else
                     % Affichage de chaque canal séparément.
                     for ch = 1:layoutOptions.Nchannel
@@ -375,10 +389,14 @@ end
                         ax = nexttile(masterTL, tileIndex, [layoutOptions.Nbrick, layoutOptions.Nbrick]);
                         [displayImage, vContours]=score_makeComposite(roiData,1,layoutOptions);
                         %  img = roiData.image(:,:,ch,1);
-                        imshow(displayImage(:,:,:,ch), []);
+                        hImg = imshow(displayImage(:,:,:,ch), []);
+                        hScale = score_drawChannelScaleBar(ax, layoutOptions, ch);
+                        if ~isempty(hScale)
+                            graphicsHandles.scaleBarHandles(tileIndex) = hScale;
+                        end
 
 if ch == 1
-    titleStr = localBuildMovieRoiTitle_(layoutOptions, roiData);
+    titleStr = score_wrapDisplayLabel(localBuildMovieRoiTitle_(layoutOptions, roiData), 28);
     if strlength(titleStr) > 0
         text(ax, 0.99, 0.99, titleStr, ...
             'Units','normalized', ...
@@ -389,16 +407,22 @@ if ch == 1
             'Interpreter','none', ...
             'Clipping','on');
     end
+    score_drawMovieEventText(ax, layoutOptions, layoutOptions.frames(1));
 end
 
                         %  title(sprintf('ROI(%d) Ch:%d', roiIndex, ch));
+                        title(ax, score_wrapDisplayLabel(localChannelLabel_(layoutOptions, ch), 24), ...
+                            'FontName', 'Arial', ...
+                            'FontSize', floor(sqrt(scalingFactor)*fontsize), ...
+                            'Color', textColor, ...
+                            'Interpreter','none', ...
+                            'FontWeight', 'normal');
 
                         [htext, hvector]=score_displayVectorGraphics(ax, 1, ch, vContours , layoutOptions);
 
                         graphicsHandles.vectorHandles(tileIndex)=[htext hvector];
 
-                        imageHandles = ax.Children(strcmp(get(ax.Children, 'Type'), 'image'));
-                        graphicsHandles.imgHandles(tileIndex) =  imageHandles;
+                        graphicsHandles.imgHandles(tileIndex) = hImg;
                     end
                 end
 
@@ -417,6 +441,7 @@ end
                         end
 
                         ax = nexttile(masterTL, tileIndex, [1, wid]);
+                        localAddMovieImageDataGap(ax, layoutOptions, ds);
                         xtickformat(ax, '%.1f');
                         ytickformat(ax, '%.1f');
 
@@ -596,6 +621,22 @@ line(ax, [xRight xRight], ylim_, ...
     'Color', background, 'LineWidth', wid, 'LineStyle', '-');
 end
 
+function localAddMovieImageDataGap(ax, layoutOptions, dataPanelIndex)
+try
+    if ~isfield(layoutOptions, 'mode') || ~strcmpi(string(layoutOptions.mode), "movie") || ...
+            ~isgraphics(ax) || dataPanelIndex ~= 1
+        return;
+    end
+    ax.Units = 'normalized';
+    pos = ax.Position;
+    gap = min(0.025, max(0.008, 0.12 * pos(4)));
+    pos(2) = pos(2) - gap;
+    pos(4) = max(0.001, pos(4) - gap);
+    ax.Position = pos;
+catch
+end
+end
+
 
 function str = localBuildMovieRoiTitle_(layoutOptions, roiData)
 
@@ -616,3 +657,14 @@ else
 end
 end
 
+function label = localChannelLabel_(layoutOptions, ch)
+label = layoutOptions.channel{ch};
+try
+    if isfield(layoutOptions, 'channelLabel') && numel(layoutOptions.channelLabel) >= ch && ...
+            strlength(string(layoutOptions.channelLabel{ch})) > 0
+        label = char(string(layoutOptions.channelLabel{ch}));
+    end
+catch
+    label = layoutOptions.channel{ch};
+end
+end

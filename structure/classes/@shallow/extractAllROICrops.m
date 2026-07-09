@@ -27,6 +27,7 @@ ROISelect      = [];         % [] => toutes (par FOV), numeric ou cell array
 
 PadExtraChannels = false;    % append zeros for extra ROI channels (seg masks, etc.)
 MemoryOnly        = false;   % keep extracted ROI images in memory; do not touch H5/MAT files
+CancelTokenFile   = '';      % cooperative cancellation token written by Hub / pipeline runner
 
 % --- OPTIONS DIVERSES ---
 ForceChannelNames = true;    % impose les noms de canaux des ROI = chanSelNames
@@ -165,8 +166,11 @@ for i = 1:2:numel(varargin)
             PadExtraChannels = logical(varargin{i+1});
         case "memoryonly"
             MemoryOnly = logical(varargin{i+1});
+        case {"canceltokenfile","cancel_token_file"}
+            CancelTokenFile = char(string(varargin{i+1}));
     end
 end
+checkExtractionCancellation(CancelTokenFile, hprogressbar, 'startup');
 
 % ---- Drift fallbacks (avoid missing vars during refactor) ----
 if ~exist('DriftMethod','var')       || isempty(DriftMethod),       DriftMethod = 'subpixel'; end
@@ -323,6 +327,7 @@ end
 pbFOV = makeConsolePB('FOV', numel(FOVIndex), 'Indent',0);
 
 for kF = 1:numel(FOVIndex)
+    checkExtractionCancellation(CancelTokenFile, hprogressbar, sprintf('before FOV %d/%d', kF, numel(FOVIndex)));
     iFov  = FOVIndex(kF);
     fovObj = shallowObj.fov(iFov);
 
@@ -552,12 +557,15 @@ for kF = 1:numel(FOVIndex)
     % -------- Estimation mémoire & taille de bloc temporel --------
     [H,W,sampleBytes] = probeFrameSpec(fovObj, chanSelIdx(1));
 
-    perBlockBudget = max(64e6, 0.25 * double(availBytes));
+    maxBlockBudget = 4e9;
+    perBlockBudget = min(maxBlockBudget, max(64e6, 0.25 * double(availBytes)));
     Tblock_auto    = max(1, floor(perBlockBudget / double(H*W*Csel*sampleBytes)));
     Tblock_auto    = max(1, min(Tblock_auto, nFramesThisRun));
 
     frameStarts = 1:Tblock_auto:nFramesThisRun;
     nBlocks     = numel(frameStarts);
+    fprintf('   Block memory budget ~ %.1f GB (raw image block cap %.1f GB)\n', ...
+        double(perBlockBudget)/1e9, double(maxBlockBudget)/1e9);
     fprintf('   RAM avail ~ %.1f GB → Tblock=%d (H=%d,W=%d,Csel=%d,class=%s)\n', ...
         double(availBytes)/1e9, Tblock_auto, H, W, Csel, sampleClass);
 
@@ -566,6 +574,7 @@ for kF = 1:numel(FOVIndex)
     
     % --------- Boucle bloc par bloc ---------
     for ib = 1:nBlocks
+        checkExtractionCancellation(CancelTokenFile, hprogressbar, sprintf('before block %d/%d', ib, nBlocks));
         fs = frameStarts(ib);
         fe = min(fs+Tblock_auto-1, nFramesThisRun);
 
@@ -578,7 +587,8 @@ for kF = 1:numel(FOVIndex)
         % 1) Lire bloc FOV (grayscale enforced)
         blockImg = loadFOVBlock_readImage( ...
             fovObj, frameBatch, chanSelIdx, ...
-            @(it,NT,msg) pbFrm.update(it, msg) );
+            @(it,NT,msg) updateBlockProgress(pbFrm, it, msg, CancelTokenFile, hprogressbar) );
+        checkExtractionCancellation(CancelTokenFile, hprogressbar, sprintf('after block %d/%d load', ib, nBlocks));
 
         % UI update
         fracGlobal = ((kF-1) + (ib-1)/max(1,nBlocks)) / max(1,numel(FOVIndex));
@@ -633,6 +643,7 @@ for kF = 1:numel(FOVIndex)
 
 
         if CorrectDrift
+            checkExtractionCancellation(CancelTokenFile, hprogressbar, sprintf('before block %d/%d drift', ib, nBlocks));
             disp('Computing drift....');
 
             % --- Choose channel used for drift estimation (local index in chanSelNames/blockImg)
@@ -717,6 +728,7 @@ for kF = 1:numel(FOVIndex)
                 'images', blockImg, ...
                 'framesid', frameBatch, ...
                 driftArgs{:});
+            checkExtractionCancellation(CancelTokenFile, hprogressbar, sprintf('after block %d/%d drift', ib, nBlocks));
 
 
 
@@ -770,6 +782,7 @@ for kF = 1:numel(FOVIndex)
 
         % 2) Crops + Append ROI par ROI
         for rIdx = 1:nROI
+            checkExtractionCancellation(CancelTokenFile, hprogressbar, sprintf('block %d/%d ROI %d/%d', ib, nBlocks, rIdx, nROI));
             r  = ROI(rIdx).obj;
             bb = ROI(rIdx).bbox;
 
@@ -911,6 +924,7 @@ for kF = 1:numel(FOVIndex)
             else
                 didSave = r.save(chanSelNames, false);
             end
+            checkExtractionCancellation(CancelTokenFile, hprogressbar, sprintf('after block %d/%d ROI %d/%d save', ib, nBlocks, rIdx, nROI));
 
             % --- Optional: pad extra channels (segmentation masks, etc.) ---
             if ~MemoryOnly && Extend && PadExtraChannels && didSave
@@ -1069,6 +1083,48 @@ catch
 end
 end
 
+function updateBlockProgress(pbFrm, it, msg, cancelTokenFile, hprogressbar)
+if ~isempty(pbFrm)
+    try
+        pbFrm.update(it, msg);
+    catch
+    end
+end
+checkExtractionCancellation(cancelTokenFile, hprogressbar, msg);
+end
+
+function checkExtractionCancellation(cancelTokenFile, hprogressbar, where)
+if nargin < 1 || isempty(cancelTokenFile)
+    cancelTokenFile = '';
+end
+if nargin < 2
+    hprogressbar = [];
+end
+if nargin < 3 || isempty(where)
+    where = 'ROI extraction';
+end
+
+cancelRequested = false;
+try
+    cancelRequested = ~isempty(cancelTokenFile) && exist(char(string(cancelTokenFile)), 'file') == 2;
+catch
+    cancelRequested = false;
+end
+
+if ~cancelRequested && ~isempty(hprogressbar) && isvalidHandle(hprogressbar)
+    try
+        if isprop(hprogressbar, 'CancelRequested') && hprogressbar.CancelRequested
+            cancelRequested = true;
+        end
+    catch
+    end
+end
+
+if cancelRequested
+    error('runPipeline:Cancelled', 'ROI extraction cancelled by user at %s.', char(string(where)));
+end
+end
+
 function pb = makeConsolePB(titleStr, totalCount, varargin)
 % (UNCHANGED) ...
 ip = inputParser;
@@ -1223,13 +1279,44 @@ function [availBytes, note] = getAvailableMemoryBytes()
 note = '';
 availBytes = 2e9;
 try
+    if ~ispc
+        [hostBytes, hostNote] = readLinuxMemAvailableBytes();
+        [cgroupBytes, cgroupNote] = readCgroupAvailableBytes();
+
+        candidates = [];
+        notes = {};
+        if ~isempty(hostBytes) && isfinite(hostBytes) && hostBytes > 0
+            candidates(end+1) = hostBytes;
+            notes{end+1} = hostNote;
+        end
+        if ~isempty(cgroupBytes) && isfinite(cgroupBytes) && cgroupBytes > 0
+            candidates(end+1) = cgroupBytes;
+            notes{end+1} = cgroupNote;
+        end
+
+        if isempty(candidates)
+            try
+                feature('memstats');
+                note = 'feature(''memstats'') available (no unified free bytes) -> using 2 GB fallback.';
+            catch
+                note = 'No Linux memory estimate available -> using 2 GB fallback.';
+            end
+        else
+            availBytes = min(candidates);
+            note = sprintf('Linux memory estimate: %s.', strjoin(notes, '; '));
+        end
+
+        availBytes = max(256e6, 0.8 * availBytes);
+        return;
+    end
+
     if ispc
         m = memory;
         availBytes = double(m.MaxPossibleArrayBytes);
         note = sprintf('Windows memory(): MaxPossibleArrayBytes=%.1f GB', availBytes/1e9);
     else
         try
-            feature('memstats'); %#ok<NASGU>
+            feature('memstats');
             note = 'feature(''memstats'') available (no unified free bytes) → using 2 GB fallback.';
         catch
             note = 'No memory() on this platform → using 2 GB fallback.';
@@ -1239,6 +1326,82 @@ catch
     note = 'Unable to query memory → using 2 GB fallback.';
 end
 availBytes = max(256e6, 0.8 * availBytes);
+end
+
+function [availBytes, note] = readLinuxMemAvailableBytes()
+availBytes = [];
+note = '';
+if ~isunix || ~isfile('/proc/meminfo')
+    return;
+end
+
+txt = fileread('/proc/meminfo');
+tok = regexp(txt, '(?m)^MemAvailable:\s+(\d+)\s+kB\s*$', 'tokens', 'once');
+source = 'MemAvailable';
+if isempty(tok)
+    tok = regexp(txt, '(?m)^MemFree:\s+(\d+)\s+kB\s*$', 'tokens', 'once');
+    source = 'MemFree';
+end
+if isempty(tok)
+    return;
+end
+
+availBytes = str2double(tok{1}) * 1024;
+note = sprintf('/proc/meminfo %s=%.1f GB', source, availBytes/1e9);
+end
+
+function [availBytes, note] = readCgroupAvailableBytes()
+availBytes = [];
+note = '';
+if ~isunix
+    return;
+end
+
+[limitBytes, limitPath] = readFirstNumericFile({ ...
+    '/sys/fs/cgroup/memory.max', ...
+    '/sys/fs/cgroup/memory/memory.limit_in_bytes'});
+if isempty(limitBytes) || ~isfinite(limitBytes) || limitBytes <= 0 || limitBytes > 1e18
+    return;
+end
+
+[currentBytes, currentPath] = readFirstNumericFile({ ...
+    '/sys/fs/cgroup/memory.current', ...
+    '/sys/fs/cgroup/memory/memory.usage_in_bytes'});
+if isempty(currentBytes) || ~isfinite(currentBytes) || currentBytes < 0
+    return;
+end
+
+availBytes = max(0, limitBytes - currentBytes);
+note = sprintf('cgroup %s %.1f GB minus %s %.1f GB = %.1f GB', ...
+    baseFileName(limitPath), limitBytes/1e9, ...
+    baseFileName(currentPath), currentBytes/1e9, ...
+    availBytes/1e9);
+end
+
+function [value, usedPath] = readFirstNumericFile(paths)
+value = [];
+usedPath = '';
+for ii = 1:numel(paths)
+    p = paths{ii};
+    if ~isfile(p)
+        continue;
+    end
+    raw = strtrim(fileread(p));
+    if isempty(raw) || strcmpi(raw, 'max')
+        continue;
+    end
+    v = str2double(raw);
+    if isfinite(v)
+        value = double(v);
+        usedPath = p;
+        return;
+    end
+end
+end
+
+function name = baseFileName(pathStr)
+[~, name, ext] = fileparts(pathStr);
+name = [name ext];
 end
 
 function [H,W,sampleBytes] = probeFrameSpec(fovObj, firstChan)

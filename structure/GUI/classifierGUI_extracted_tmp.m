@@ -234,6 +234,60 @@ function s = logicalToString(app, v) %#ok<INUSD>
     end
 end
 
+function msg = localGuiErrorMessage(app, ME) %#ok<INUSD>
+% localGuiErrorMessage  Compact error text suitable for uialert.
+    parts = {};
+    if ~isempty(ME.identifier)
+        parts{end+1} = ['Identifier: ' ME.identifier]; %#ok<AGROW>
+    end
+    if ~isempty(ME.message)
+        parts{end+1} = ME.message; %#ok<AGROW>
+    end
+
+    causeList = ME.cause;
+    for k = 1:min(numel(causeList), 2)
+        if ~isempty(causeList{k}.message)
+            parts{end+1} = ['Cause: ' causeList{k}.message]; %#ok<AGROW>
+        end
+    end
+
+    if isempty(parts)
+        msg = 'Training failed, but MATLAB did not provide an error message.';
+    else
+        msg = strjoin(parts, sprintf('\n\n'));
+    end
+
+    maxLen = 1800;
+    if strlength(string(msg)) > maxLen
+        msg = char(extractBefore(string(msg), maxLen));
+        msg = [msg newline newline '...'];
+    end
+end
+
+function tf = isSam31Classifier(app, classiObj) %#ok<INUSD>
+    tf = false;
+    try
+        if isprop(classiObj, 'classifierPkg') && strcmpi(char(string(classiObj.classifierPkg)), 'sam31')
+            tf = true;
+            return;
+        end
+    catch
+    end
+    try
+        if isprop(classiObj, 'trainingFun') && startsWith(char(string(classiObj.trainingFun)), 'sam31.', 'IgnoreCase', true)
+            tf = true;
+            return;
+        end
+    catch
+    end
+    try
+        if isprop(classiObj, 'classifyFun') && startsWith(char(string(classiObj.classifyFun)), 'sam31.', 'IgnoreCase', true)
+            tf = true;
+        end
+    catch
+    end
+end
+
 
 
 
@@ -457,6 +511,19 @@ function classlist = buildPackageClasslist(app, rootPath) %#ok<INUSD>
 end
 
 function cat = inferPkgCategory(app,pkgName)
+    cat = '';
+    try
+        specFun = [pkgName '.executionSpec'];
+        if ~isempty(which(specFun))
+            spec = feval(specFun);
+            if isstruct(spec) && isfield(spec, 'category') && ~isempty(spec.category)
+                cat = char(string(spec.category));
+                return;
+            end
+        end
+    catch
+    end
+
     switch lower(pkgName)
         case 'cnn_lstm'
             cat = 'LSTM';
@@ -809,26 +876,38 @@ end
                 %   aa=classiObj.outputFun
                 %   class(aa)
                 app.PostprocessingDropDown.Enable='on';
-                if numel(classiObj.outputType)
-                    outputstr=classiObj.outputType;
+                if usesExecutionSpecOutputType(app, classiObj)
+                    app.PostprocessingDropDownLabel.Text = 'Output resource';
+                    app.PostprocessingDropDown.Items = getExecutionSpecOutputChoices(app, classiObj);
+                    outputstr = normalizeExecutionSpecOutputType(app, classiObj.outputType);
+                    if isempty(outputstr)
+                        outputstr = getExecutionSpecDefaultOutputType(app, classiObj);
+                        classiObj.outputType = outputstr;
+                    end
                 else
-                    outputstr='proba';
-                end
-                %  outputstr
+                    app.PostprocessingDropDownLabel.Text = 'Post-processing';
+                    app.PostprocessingDropDown.Items = {'plain output / probabilities for each class', 'plain output / semantic segmentation', 'postprocessing', 'custom function (see below)'};
+                    if numel(classiObj.outputType)
+                        outputstr=classiObj.outputType;
+                    else
+                        outputstr='proba';
+                    end
+                    %  outputstr
 
-                switch outputstr
-                    case 'proba'
-                        outputstr='plain output / probabilities for each class';
-                    case 'segmentation'
-                        outputstr='plain output / semantic segmentation';
-                    case 'postprocessing'
-                        if ischar(classiObj.outputFun)
-                            if strcmp(classiObj.outputFun,'post')
-                                outputstr='postprocessing';
-                            else
-                                outputstr='custom function (see below)';
+                    switch outputstr
+                        case 'proba'
+                            outputstr='plain output / probabilities for each class';
+                        case 'segmentation'
+                            outputstr='plain output / semantic segmentation';
+                        case 'postprocessing'
+                            if ischar(classiObj.outputFun)
+                                if strcmp(classiObj.outputFun,'post')
+                                    outputstr='postprocessing';
+                                else
+                                    outputstr='custom function (see below)';
+                                end
                             end
-                        end
+                    end
                 end
 
                 app.PostprocessingDropDown.Value=outputstr;
@@ -1329,6 +1408,123 @@ app.NumberofannotatedROIsEditField.Value='Not available'; % need to load every s
  
         end
         end
+
+        function tf = isCellposeSAMClassifier(app, classiObj) %#ok<INUSD>
+            tf = false;
+            try
+                if isprop(classiObj, 'classifierPkg') && ...
+                        strcmpi(char(string(classiObj.classifierPkg)), 'cellposesam')
+                    tf = true;
+                    return;
+                end
+            catch
+            end
+            try
+                if isprop(classiObj, 'classifyFun') && ...
+                        any(strcmpi(char(string(classiObj.classifyFun)), {'classifyCPSAMFun','cellposesam.classify'}))
+                    tf = true;
+                    return;
+                end
+            catch
+            end
+            try
+                if isprop(classiObj, 'description') && ~isempty(classiObj.description)
+                    desc = lower(string(classiObj.description));
+                    tf = any(contains(desc, 'cellpose'));
+                end
+            catch
+                tf = false;
+            end
+        end
+
+        function tf = usesExecutionSpecOutputType(app, classiObj) %#ok<INUSD>
+            pkg = resolveClassifierPackageForOutput(app, classiObj);
+            tf = any(strcmp(pkg, {'cellposesam','deeplab_pixel_classification'}));
+        end
+
+        function pkg = resolveClassifierPackageForOutput(app, classiObj) %#ok<INUSD>
+            pkg = '';
+            try
+                if isprop(classiObj, 'classifierPkg') && ~isempty(classiObj.classifierPkg)
+                    pkg = lower(strtrim(char(string(classiObj.classifierPkg))));
+                    return;
+                end
+            catch
+            end
+            try
+                if isprop(classiObj, 'classifyFun') && ~isempty(classiObj.classifyFun)
+                    f = char(string(classiObj.classifyFun));
+                    dot = strfind(f, '.');
+                    if ~isempty(dot)
+                        pkg = lower(strtrim(f(1:dot(1)-1)));
+                        return;
+                    elseif strcmpi(f, 'classifyCPSAMFun')
+                        pkg = 'cellposesam';
+                        return;
+                    end
+                end
+            catch
+            end
+            try
+                if isprop(classiObj, 'description') && ~isempty(classiObj.description)
+                    desc = lower(string(classiObj.description));
+                    if any(contains(desc, 'cellpose'))
+                        pkg = 'cellposesam';
+                    elseif any(contains(desc, 'deeplab'))
+                        pkg = 'deeplab_pixel_classification';
+                    end
+                end
+            catch
+                pkg = '';
+            end
+        end
+
+        function choices = getExecutionSpecOutputChoices(app, classiObj)
+            choices = {'segmentation','probability','both'};
+            pkg = resolveClassifierPackageForOutput(app, classiObj);
+            try
+                spec = feval([pkg '.executionSpec'], classiObj);
+                if isfield(spec, 'choices') && isfield(spec.choices, 'outputType') && ~isempty(spec.choices.outputType)
+                    choices = spec.choices.outputType;
+                end
+            catch
+            end
+        end
+
+        function outputType = getExecutionSpecDefaultOutputType(app, classiObj)
+            outputType = 'segmentation';
+            pkg = resolveClassifierPackageForOutput(app, classiObj);
+            try
+                spec = feval([pkg '.executionSpec'], classiObj);
+                if isfield(spec, 'defaults') && isfield(spec.defaults, 'outputType') && ~isempty(spec.defaults.outputType)
+                    outputType = normalizeExecutionSpecOutputType(app, spec.defaults.outputType);
+                end
+            catch
+            end
+            if isempty(outputType)
+                outputType = 'segmentation';
+            end
+        end
+
+        function outputType = normalizeExecutionSpecOutputType(app, value) %#ok<INUSD>
+            outputType = lower(strtrim(char(string(value))));
+            outputType = strrep(outputType, '-', '_');
+            outputType = strrep(outputType, ' ', '_');
+            switch outputType
+                case {'proba','probabilities','probability_map'}
+                    outputType = 'probability';
+                case {'seg','mask','masks','semantic','semantic_segmentation','postprocessing'}
+                    outputType = 'segmentation';
+                case {'segmentation','probability','both'}
+                    % already normalized
+                otherwise
+                    if isempty(outputType)
+                        outputType = '';
+                    else
+                        outputType = 'segmentation';
+                    end
+            end
+        end
     end
 
 
@@ -1382,28 +1578,35 @@ end
         classiObj.trainClassifier('setparam');
     end
 
-    % Ensure transfer_learning list
-    if ~isfield(classiObj.trainingParam,'transfer_learning')
-        [t,~] = classiObj.version;
-        if numel(t{1,1})==0
-            str={};
-        else
-            str=t(:,4);
+    if isSam31Classifier(app, classiObj)
+        try
+            sam31.ensureClassMetadata(classiObj);
+        catch
         end
-        str=['ImageNet', str', 'ImageNet'];
-        classiObj.trainingParam.transfer_learning=str;
-        classiObj.trainingParam.tip{end+1}='Select version of the classifier to be used';
-        checkStatus(app,false);
     else
-        [t,~]=classiObj.version;
-        if numel(t{1,1})==0
-            str={};
+        % Ensure transfer_learning list for legacy MATLAB/CNN classifiers.
+        if ~isfield(classiObj.trainingParam,'transfer_learning')
+            [t,~] = classiObj.version;
+            if numel(t{1,1})==0
+                str={};
+            else
+                str=t(:,4);
+            end
+            str=['ImageNet', str', 'ImageNet'];
+            classiObj.trainingParam.transfer_learning=str;
+            classiObj.trainingParam.tip{end+1}='Select version of the classifier to be used';
+            checkStatus(app,false);
         else
-            str=t(:,4);
+            [t,~]=classiObj.version;
+            if numel(t{1,1})==0
+                str={};
+            else
+                str=t(:,4);
+            end
+            str=['ImageNet', str', classiObj.trainingParam.transfer_learning{end}];
+            classiObj.trainingParam.transfer_learning=str;
+            checkStatus(app,true);
         end
-        str=['ImageNet', str', classiObj.trainingParam.transfer_learning{end}];
-        classiObj.trainingParam.transfer_learning=str;
-        checkStatus(app,true);
     end
 
     % Build table-based editor
@@ -1593,19 +1796,26 @@ end
     classiObj = app.Data.classiObj;
 
     % set parameter menu:
-    if ~isfield(classiObj.trainingParam,'transfer_learning')
-        [t,~]=classiObj.version;
-        if numel(t{1,1})==0, str={}; else, str=t(:,4); end
-        str=['ImageNet', str', 'ImageNet'];
-        classiObj.trainingParam.transfer_learning=str;
-        classiObj.trainingParam.tip{end+1}='Select version of the classifier to be used';
-        checkStatus(app,false);
+    if isSam31Classifier(app, classiObj)
+        try
+            sam31.ensureClassMetadata(classiObj);
+        catch
+        end
     else
-        [t,~]=classiObj.version;
-        if numel(t{1,1})==0, str={}; else, str=t(:,4); end
-        str=['ImageNet', str', classiObj.trainingParam.transfer_learning{end}];
-        classiObj.trainingParam.transfer_learning=str;
-        checkStatus(app,true);
+        if ~isfield(classiObj.trainingParam,'transfer_learning')
+            [t,~]=classiObj.version;
+            if numel(t{1,1})==0, str={}; else, str=t(:,4); end
+            str=['ImageNet', str', 'ImageNet'];
+            classiObj.trainingParam.transfer_learning=str;
+            classiObj.trainingParam.tip{end+1}='Select version of the classifier to be used';
+            checkStatus(app,false);
+        else
+            [t,~]=classiObj.version;
+            if numel(t{1,1})==0, str={}; else, str=t(:,4); end
+            str=['ImageNet', str', classiObj.trainingParam.transfer_learning{end}];
+            classiObj.trainingParam.transfer_learning=str;
+            checkStatus(app,true);
+        end
     end
 
     % Rebuild table-based editor
@@ -1701,6 +1911,17 @@ end
             if app.isRefreshing, return; end
 
             value = app.PostprocessingDropDown.Value;
+            if usesExecutionSpecOutputType(app, app.Data.classiObj)
+                app.Data.classiObj.outputType = normalizeExecutionSpecOutputType(app, value);
+                app.Data.classiObj.outputFun='';
+                app.Data.classiObj.outputArg={};
+                app.PostprocessingcustomfunctionhandleEditField.Enable='off';
+                app.PostprocessingcustomfunctionhandleEditField.Value='';
+                checkStatus(app,false)
+                displayClassi(app);
+                return;
+            end
+
             pix=find(contains(app.PostprocessingDropDown.Items,value));
 
             switch pix
@@ -1920,8 +2141,24 @@ end
 
             classiObj=app.Data.classiObj;
 
+            testRois = [];
+            try
+                if ~isempty(app.UITableData.Data)
+                    testRois = find(cellfun(@(x) isequal(x, 1) || isequal(x, true), app.UITableData.Data(:,2)));
+                end
+            catch
+                testRois = [];
+            end
 
-            classifyDataGUI(classiObj,"Validation");
+            try
+                classifierOpenValidationPipeline(classiObj, ...
+                    'Rois', testRois, ...
+                    'OutputPolicy', 'replace', ...
+                    'Execution', 'Auto');
+            catch ME
+                uialert(app.ClassifierUIFigure, ME.message, ...
+                    'Validation pipeline failed', 'Icon', 'error');
+            end
             return;
 %             
 % 
@@ -2005,7 +2242,29 @@ end
         function FormattrainingsetMenuSelected(app, event)
   
     classiObj = app.Data.classiObj;
-    nrois = classiObj.trainingset;
+    if ~isempty(app.UITableData.Data)
+        selectedfortraining = cellfun(@(x) x==1, app.UITableData.Data(:,1));
+        selectedfortest = cellfun(@(x) x==1, app.UITableData.Data(:,2));
+        nrois = find(selectedfortraining');
+        testrois = find(selectedfortest');
+        classiObj.trainingset = nrois;
+        try
+            if ~isprop(classiObj,'dataset') || ~isstruct(classiObj.dataset)
+                classiObj.dataset = struct('classes', {{}}, 'channels', {{}}, ...
+                    'split', struct('train', [], 'val', [], 'test', []));
+            end
+            if ~isfield(classiObj.dataset,'split') || ~isstruct(classiObj.dataset.split)
+                classiObj.dataset.split = struct('train', [], 'val', [], 'test', []);
+            end
+            classiObj.dataset.split.train = nrois;
+            classiObj.dataset.split.val = [];
+            classiObj.dataset.split.test = testrois;
+        catch
+        end
+        app.Data.classiObj = classiObj;
+    else
+        nrois = classiObj.getTrainingROIIndices();
+    end
 
     if numel(nrois) == 0
         uialert(app.ClassifierUIFigure, ...
@@ -2037,7 +2296,7 @@ end
         'Message','Exporting trainingset to files; Please wait...');
     d.Value = 0.33;
 
-    args = {'Frames', framesToProcess};
+    args = {'Frames', framesToProcess, 'Rois', nrois};
 
     % Call
     output = app.Data.classiObj.formatDataForTraining(args{:});
@@ -2080,33 +2339,64 @@ end
                  return;
             end
 
-            nrois=classiObj.trainingset; 
+            if ~isempty(app.UITableData.Data)
+                selectedfortraining = cellfun(@(x) x==1, app.UITableData.Data(:,1));
+                selectedfortest = cellfun(@(x) x==1, app.UITableData.Data(:,2));
+                nrois = find(selectedfortraining');
+                testrois = find(selectedfortest');
+                classiObj.trainingset = nrois;
+                try
+                    if ~isprop(classiObj,'dataset') || ~isstruct(classiObj.dataset)
+                        classiObj.dataset = struct('classes', {{}}, 'channels', {{}}, ...
+                            'split', struct('train', [], 'val', [], 'test', []));
+                    end
+                    if ~isfield(classiObj.dataset,'split') || ~isstruct(classiObj.dataset.split)
+                        classiObj.dataset.split = struct('train', [], 'val', [], 'test', []);
+                    end
+                    classiObj.dataset.split.train = nrois;
+                    classiObj.dataset.split.val = [];
+                    classiObj.dataset.split.test = testrois;
+                catch
+                end
+                app.Data.classiObj = classiObj;
+            else
+                nrois=classiObj.trainingset;
+            end
             if numel(nrois)==0
                   uialert(app.ClassifierUIFigure,'You must select at least one ROI in the Dataset panel  !','Error')
                  return;
             end
 
-            d = uiprogressdlg(app.ClassifierUIFigure,'Title','Please Wait...',...
-                'Message','Training network; Please wait...');
-            d.Value=0.5;
-
-            [~, check]=classiObj.loadClassifier('check');
-            if check==1
-                evalin('base',['clear ' classiObj.strid]);
+            d = [];
+            try
+                d = uiprogressdlg(app.ClassifierUIFigure, ...
+                    'Title', 'Preparing training run', ...
+                    'Message', 'Preparing classifier training pipeline...', ...
+                    'Indeterminate', 'on', ...
+                    'Cancelable', 'off');
+                drawnow;
+            catch
             end
 
-            checkStatus(app);
-
-
-
-            classiObj.trainClassifier;
-
-            d.Value=1;
-
-            pause(1);
-            close(d)
-
-           uialert(app.ClassifierUIFigure,'Training is complete!','Success','Icon','success');
+            try
+                if ~isempty(d) && isvalid(d)
+                    d.Message = 'Checking classifier inputs and opening pipeline2...';
+                    drawnow;
+                end
+                classifierOpenTrainingPipeline(classiObj, ...
+                    'Rois', nrois, ...
+                    'OutputPolicy', 'replace', ...
+                    'Execution', 'Auto');
+                if ~isempty(d) && isvalid(d)
+                    close(d);
+                end
+            catch ME
+                if ~isempty(d) && isvalid(d)
+                    close(d);
+                end
+                msg = localGuiErrorMessage(app, ME);
+                uialert(app.ClassifierUIFigure, msg, 'Training pipeline failed', 'Icon','error');
+            end
         end
 
         % Menu selected function: SaveclassifierMenu

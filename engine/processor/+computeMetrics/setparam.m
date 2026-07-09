@@ -31,17 +31,24 @@ else
 end
 
 paramout = struct();
+paramout.outputName = 'channel_quantification';
 paramout.maskChannelCount = maskChannelCount;
 paramout.scoreChannelCount = scoreChannelCount;
 for i = 1:maskChannelCount
     paramout.(sprintf('mask%d_name', i)) = [listChannels listChannels{1}];
     paramout.(sprintf('mask%d_stat', i)) = true;
     paramout.(sprintf('mask%d_label', i)) = defaultMaskLabel(i);
+    paramout.(sprintf('mask%d_backgroundLabel', i)) = {'auto','0','1','auto'};
+    paramout.(sprintf('mask%d_scoreLabel', i)) = 'all';
 end
 for i = 1:scoreChannelCount
     paramout.(sprintf('channel%d_name', i)) = [listChannels listChannels{1}];
 end
 paramout.BrightestPixels = 20;
+paramout.backgroundMethod = {'mean','median','percentile','mean'};
+paramout.backgroundPercentile = 20;
+paramout.backgroundDilatePx = 0;
+paramout.computeMaskCombinations = true;
 paramout.tip = buildTips(maskChannelCount, scoreChannelCount);
 end
 
@@ -75,6 +82,7 @@ end
 
 function tip = buildTips(maskChannelCount, scoreChannelCount)
     tip = { ...
+        'Output dataseries groupid for channel metrics', ...
         'Number of mask channels used for measurements', ...
         'Number of image channels scored inside each selected mask' ...
         };
@@ -82,13 +90,19 @@ function tip = buildTips(maskChannelCount, scoreChannelCount)
         tip = [tip, { ...
             sprintf('Name of Mask channel #%d', i), ...
             sprintf('Compute detailed Mask #%d statistics (area, etc)', i), ...
-            sprintf('Label of Mask channel #%d', i) ...
+            sprintf('Label of Mask channel #%d', i), ...
+            sprintf('Background label for Mask channel #%d: auto, 0 for instance masks, or 1 for U-Net/pixel-classifier maps', i), ...
+            sprintf('Foreground label to score for Mask channel #%d: all/empty/0 scores every non-background label separately; a numeric index scores only that label and enables mask combinations', i) ...
             }]; %#ok<AGROW>
     end
     for i = 1:scoreChannelCount
         tip{end+1} = sprintf('Channel name #%d to score', i); %#ok<AGROW>
     end
     tip{end+1} = 'Number of brightest pixels used for top-pixel intensity metrics';
+    tip{end+1} = 'Background reducer for pixels outside all segmented objects: mean, median, or percentile';
+    tip{end+1} = 'Percentile used when backgroundMethod is percentile';
+    tip{end+1} = 'Dilate all segmented objects by this many pixels before selecting background pixels';
+    tip{end+1} = 'When multiple masks are selected, compute pairwise AND and NOT composite-mask fluorescence metrics';
 end
 
 function out = normalizeChannelList(ch)

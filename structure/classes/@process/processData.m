@@ -128,6 +128,7 @@ for i=1:numel(roiobj) %size(roilist,2) % loop on all ROIs using parrallel comput
 
     hadImageInMemory = ~isempty(roiobj(i).image);
     hadDataInMemory = ~isempty(roiobj(i).data);
+    ensureRequiredChannelsLoadedLocal(roiobj(i), ctxBase);
     if para
         hadImageByIdx(i) = hadImageInMemory;
         hadDataByIdx(i) = hadDataInMemory;
@@ -251,7 +252,15 @@ if para % parallel computing
             end
         end
 
-        safeROIManagement(roiobj(idx),image,data,{},cachePolicy,hadImageByIdx(idx),hadDataByIdx(idx),saveMode);
+        saveChannels = {};
+        if isstruct(param)
+            if isfield(param,'saveChannels') && ~isempty(param.saveChannels)
+                saveChannels = param.saveChannels;
+            elseif isfield(param,'outputChannelName') && ~isempty(param.outputChannelName)
+                saveChannels = {char(string(param.outputChannelName))};
+            end
+        end
+        safeROIManagement(roiobj(idx),image,data,saveChannels,cachePolicy,hadImageByIdx(idx),hadDataByIdx(idx),saveMode);
         updateProcessProgress(ctxBase, p, i, numel(logparf), 'Processed');
         %     roiobj(idx).results=results;
         %
@@ -321,9 +330,11 @@ end
         imageCache = image;
         dataCache = data;
         roiobj.data=data;
-        roiobj.image=image;
+        if numel(image)
+            roiobj.image=image;
+        end
         if shouldDeferSaveLocal(saveModeLocal)
-            markDeferredDirtyLocal(roiobj, hasSavableDataseries(data), numel(image) > 0);
+            markDeferredDirtyLocal(roiobj, hasSavableDataseries(data), numel(image) > 0, saveChannels);
             disp('[processData] Defer save requested; processor output kept in ROI memory.');
             return;
         end
@@ -481,19 +492,30 @@ end
         tf = strcmp(normalizeSaveModeLocal(mode), 'defer');
     end
 
-    function markDeferredDirtyLocal(roiobjLocal, hasData, hasImage)
+    function markDeferredDirtyLocal(roiobjLocal, hasData, hasImage, saveChannels)
+        if nargin < 4
+            saveChannels = {};
+        end
         try
             if ~isstruct(roiobjLocal.results)
                 roiobjLocal.results = struct();
             end
-            dirty = struct('data', false, 'image', false);
+            dirty = struct('data', false, 'image', false, 'fullImage', false, 'channels', {{}});
             if isfield(roiobjLocal.results, 'pipelineDeferredDirty') && isstruct(roiobjLocal.results.pipelineDeferredDirty)
                 dirty = roiobjLocal.results.pipelineDeferredDirty;
                 if ~isfield(dirty,'data'), dirty.data = false; end
                 if ~isfield(dirty,'image'), dirty.image = false; end
+                if ~isfield(dirty,'fullImage'), dirty.fullImage = false; end
+                if ~isfield(dirty,'channels'), dirty.channels = {}; end
             end
             dirty.data = logical(dirty.data || hasData);
             dirty.image = logical(dirty.image || hasImage);
+            if hasImage && isempty(saveChannels)
+                dirty.fullImage = true;
+                dirty.channels = {};
+            elseif hasImage && ~dirty.fullImage
+                dirty.channels = unique([cellstr(string(dirty.channels(:)))' cellstr(string(saveChannels(:)))'], 'stable');
+            end
             roiobjLocal.results.pipelineDeferredDirty = dirty;
         catch
         end
@@ -581,6 +603,76 @@ end
         else
             txt = sprintf('%dh%02dm', floor(secondsValue/3600), floor(mod(secondsValue,3600)/60));
         end
+    end
+
+    function ensureRequiredChannelsLoadedLocal(roiobjLocal, ctx)
+        channels = requiredChannelsFromContextLocal(ctx);
+        if isempty(channels)
+            return;
+        end
+        channelsToLoad = channels(~cellfun(@(ch) isChannelLoadedInMemoryLocal(roiobjLocal, ch), channels));
+        if isempty(channelsToLoad)
+            return;
+        end
+        try
+            roiobjLocal.load('Channel', channelsToLoad, 'Silent');
+        catch ME
+            warning('processData:RequiredChannelLoadFailed', ...
+                'Could not preload required ROI channel(s) %s for ROI "%s": %s', ...
+                strjoin(channelsToLoad, ', '), safeRoiId(roiobjLocal), ME.message);
+        end
+    end
+
+    function tf = isChannelLoadedInMemoryLocal(roiobjLocal, channelName)
+        tf = false;
+        try
+            if isempty(channelName) || isempty(roiobjLocal.image)
+                return;
+            end
+            idx = roiobjLocal.findChannelID(char(string(channelName)), 'exact');
+            tf = ~isempty(idx) && all(idx >= 1) && all(idx <= size(roiobjLocal.image, 3));
+        catch
+            tf = false;
+        end
+    end
+
+    function channels = requiredChannelsFromContextLocal(ctx)
+        channels = {};
+        try
+            if isstruct(ctx) && isfield(ctx, 'io') && isstruct(ctx.io) && ...
+                    isfield(ctx.io, 'requiredChannels') && ~isempty(ctx.io.requiredChannels)
+                channels = normalizeChannelListLocal(ctx.io.requiredChannels);
+            end
+        catch
+            channels = {};
+        end
+    end
+
+    function channels = normalizeChannelListLocal(value)
+        channels = {};
+        if isempty(value)
+            return;
+        end
+        if iscell(value)
+            for ii = 1:numel(value)
+                channels = [channels normalizeChannelListLocal(value{ii})]; %#ok<AGROW>
+            end
+            channels = unique(channels(~cellfun(@isempty, channels)), 'stable');
+            return;
+        end
+        if ischar(value) || (isstring(value) && isscalar(value))
+            vals = regexp(char(string(value)), '[,;]', 'split');
+        else
+            vals = cellstr(string(value(:)));
+        end
+        for ii = 1:numel(vals)
+            s = strtrim(char(string(vals{ii})));
+            if isempty(s) || startsWith(s, '<') || any(strcmpi(s, {'none','auto','n/a','<all>'}))
+                continue;
+            end
+            channels{end+1} = s; %#ok<AGROW>
+        end
+        channels = unique(channels(~cellfun(@isempty, channels)), 'stable');
     end
 
     function out = ternaryLocal(cond, a, b)

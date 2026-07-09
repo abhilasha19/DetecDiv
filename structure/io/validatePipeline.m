@@ -2,7 +2,7 @@ function [ok, report] = validatePipeline(pipe, ctx, opts)
 % validatePipeline  Validate pipeline structure and dependencies.
 
     ok = true;
-    report = struct('errors',{{}}, 'warnings',{{}}, 'order', [], 'nodes', [], 'edges', [], 'contracts', struct(), 'semantic', struct(), 'binding', struct(), 'classifierArtifacts', [], 'pathChecks', [], 'solver', struct());
+    report = struct('errors',{{}}, 'warnings',{{}}, 'order', [], 'nodes', [], 'edges', [], 'contracts', struct(), 'semantic', struct(), 'binding', struct(), 'classifierArtifacts', [], 'pluginPackages', [], 'pathChecks', [], 'solver', struct());
 
     if nargin < 2 || isempty(ctx)
         ctx = struct();
@@ -122,6 +122,17 @@ function [ok, report] = validatePipeline(pipe, ctx, opts)
             if ~isempty(artifactWarnings)
                 report.warnings = [report.warnings, artifactWarnings]; %#ok<AGROW>
             end
+            [pluginErrors, pluginWarnings, pluginReport] = pluginPackageIssues(node, ctx);
+            if ~isempty(pluginReport)
+                report.pluginPackages = appendStructArray(report.pluginPackages, pluginReport);
+            end
+            if ~isempty(pluginErrors)
+                ok = false;
+                report.errors = [report.errors, pluginErrors]; %#ok<AGROW>
+            end
+            if ~isempty(pluginWarnings)
+                report.warnings = [report.warnings, pluginWarnings]; %#ok<AGROW>
+            end
             [pathErrors, pathWarnings, pathReports] = nodePathIssues(node, ctx);
             if ~isempty(pathReports)
                 report.pathChecks = appendStructArray(report.pathChecks, pathReports);
@@ -212,9 +223,29 @@ function nodes = applyValidationRunNodeOverrides(nodes, ctx)
             nodes(i).params = struct();
         end
         if isstruct(patch) && isfield(patch, 'params') && isstruct(patch.params)
-            nodes(i).params = mergeStructLocal(nodes(i).params, patch.params);
+            nodes(i).params = mergeStructLocal(nodes(i).params, sanitizeRunNodeParamPatch(nodes(i).params, patch.params));
         elseif isstruct(patch)
-            nodes(i).params = mergeStructLocal(nodes(i).params, rmfieldIfPresentLocal(patch, {'id','nodeId'}));
+            patchParams = rmfieldIfPresentLocal(patch, {'id','nodeId'});
+            nodes(i).params = mergeStructLocal(nodes(i).params, sanitizeRunNodeParamPatch(nodes(i).params, patchParams));
+        end
+    end
+end
+
+function patch = sanitizeRunNodeParamPatch(baseParams, patch)
+    if ~isstruct(patch)
+        return;
+    end
+    if ~isstruct(baseParams)
+        baseParams = struct();
+    end
+    names = fieldnames(patch);
+    for i = 1:numel(names)
+        key = names{i};
+        if ~isfield(baseParams, key) || isempty(baseParams.(key))
+            continue;
+        end
+        if isGenericSourceSymbolicBinding(patch.(key)) && ~isSymbolicResourceBinding(baseParams.(key))
+            patch = rmfield(patch, key);
         end
     end
 end
@@ -481,6 +512,12 @@ function producers = producerIdsForConcreteResource(value, spec, resources)
     if isempty(value)
         return;
     end
+    if strcmpi(char(string(getField(spec, 'type', ''))), 'dataSeriesVariable')
+        value = dataSeriesNameFromVariableBinding(value);
+        if isempty(value)
+            return;
+        end
+    end
     wantedType = lower(char(string(getField(spec, 'type', ''))));
     wantedRole = lower(char(string(getField(spec, 'role', ''))));
     for i = 1:numel(resources)
@@ -590,6 +627,12 @@ function [missing, deferred] = missingParamsForNode(node, ctx, mode)
     for i = 1:numel(req)
         k = char(string(req{i}));
         scope = paramScopeForNode(node, k);
+        if strcmpi(k, 'path') && strcmpi(char(string(getField(node, 'type', ''))), 'classifier')
+            % Classifier nodes consume ROI/image data from the execution
+            % context. A stale dataloader "path" requirement can remain when
+            % a classifier is inserted in a raw-start slot.
+            continue;
+        end
         if isfield(p,k) && ~isempty(p.(k))
             continue;
         end
@@ -780,6 +823,9 @@ function state = initialSemanticState(ctx)
     state.hasFovList = (isfield(ctx,'fovList') && ~isempty(ctx.fovList));
     state.hasRoiList = (isfield(ctx,'roiList') && ~isempty(ctx.roiList)) || ...
                        (isfield(ctx,'rois') && ~isempty(ctx.rois));
+    if ~state.hasRoiList && validationStartsFromExistingProject(ctx)
+        state.hasRoiList = true;
+    end
     state.hasMasks = isfield(ctx,'masks') && ~isempty(ctx.masks);
     state.hasDataSeries = (isfield(ctx,'dataSeries') && ~isempty(ctx.dataSeries)) || ...
                           (isfield(ctx,'dataseries') && ~isempty(ctx.dataseries)) || ...
@@ -889,7 +935,7 @@ function channels = resolveNodeConfiguredChannels(node, selectors)
                 continue;
             end
             if isfield(params, key) && ~isempty(params.(key))
-                channels = mergeKnownChannels(channels, normalizeConfiguredSelectionValue(params.(key)));
+                channels = mergeKnownChannels(channels, normalizeConfiguredOrSymbolicSelectionValue(params.(key)));
             end
         end
         if ~isempty(channels)
@@ -912,7 +958,7 @@ function channels = resolveNodeConfiguredChannels(node, selectors)
             continue;
         end
         if isfield(params, key) && ~isempty(params.(key))
-            channels = normalizeChannelList(params.(key));
+            channels = normalizeConfiguredOrSymbolicSelectionValue(params.(key));
             if ~isempty(channels)
                 return;
             end
@@ -1058,7 +1104,6 @@ function report = solvePipelineBindings(nodes, edges, ctx, order)
                 report.warnings{end+1} = nodeReport.message; %#ok<AGROW>
                 report.needsRunBinding{end+1} = char(string(node.id)); %#ok<AGROW>
             case 'auto_resolvable'
-                report.warnings{end+1} = nodeReport.message; %#ok<AGROW>
                 report.autoResolvable{end+1} = char(string(node.id)); %#ok<AGROW>
         end
         state = applyConstraintOutputs(node, state, nodeReport);
@@ -1106,6 +1151,7 @@ function nodeReport = evaluateNodeBinding(node, state)
     symbolicChannelCollectionSelected = hasSymbolicChannelCollectionSelection(node, binding, selectors);
     symbolicResourceSelected = hasSymbolicResourceSelection(node, binding, selectors);
     configuredChannels = configuredChannels(~isSymbolicChannelSelectionCell(configuredChannels));
+    configuredChannels = expandChannelPatternSelections(configuredChannels, availableChannels);
     allChannelsSelected = isAllChannelSelection(configuredChannels) || symbolicChannelCollectionSelected;
     if allChannelsSelected
         if ~isempty(availableChannels)
@@ -1338,6 +1384,44 @@ function nodeReport = attachResourceBindingReport(nodeReport, node, state)
             nodeReport.message = unresolved(1).message;
         end
     end
+    nodeReport = reconcileLegacyChannelReportWithResources(nodeReport, inputReports);
+end
+
+function nodeReport = reconcileLegacyChannelReportWithResources(nodeReport, inputReports)
+    if ~strcmpi(char(string(getField(nodeReport, 'status', ''))), 'invalid') || isempty(inputReports)
+        return;
+    end
+
+    configured = normalizeChannelList(getField(nodeReport, 'configuredChannels', {}));
+    available = normalizeChannelList(getField(nodeReport, 'availableChannels', {}));
+    if isempty(configured)
+        return;
+    end
+
+    configuredLower = normalizedLowerNameList(configured);
+    availableLower = normalizedLowerNameList(available);
+    missingLower = setdiff(configuredLower, availableLower, 'stable');
+    if isempty(missingLower)
+        return;
+    end
+
+    covered = {};
+    for i = 1:numel(inputReports)
+        status = lower(char(string(getField(inputReports(i), 'status', ''))));
+        if ~any(strcmp(status, {'resolved', 'auto_resolvable'}))
+            continue;
+        end
+        covered = mergeKnownChannels(covered, normalizeChannelList(getField(inputReports(i), 'configured', ''))); %#ok<AGROW>
+        covered = mergeKnownChannels(covered, normalizeChannelList(getField(inputReports(i), 'concreteName', ''))); %#ok<AGROW>
+        covered = mergeKnownChannels(covered, normalizeChannelList(getField(inputReports(i), 'symbol', ''))); %#ok<AGROW>
+    end
+    coveredLower = normalizedLowerNameList(covered);
+    if isempty(setdiff(missingLower, coveredLower, 'stable'))
+        nodeReport.status = 'resolved';
+        nodeReport.message = ['Node ' char(string(getField(nodeReport, 'nodeId', ''))) ...
+            ' binds configured channel input(s) through upstream resources.'];
+        nodeReport.availableChannels = mergeKnownChannels(available, covered);
+    end
 end
 
 function outputs = expandAllRoiExtractChannelOutputs(node, nodeReport, state, outputs)
@@ -1411,17 +1495,42 @@ function br = evaluateResourceInput(node, spec, availableResources, ctx)
     if nargin < 4 || isempty(ctx)
         ctx = struct();
     end
+    [hasConfiguredRaw, configuredRaw] = resolveResourceRawValue(node, spec);
     configured = resolveResourceConfiguredValue(node, spec);
     symbolic = resolveResourceSymbolicValue(node, spec);
     compatible = findCompatibleResources(availableResources, spec);
     graphCompatible = nonContextResources(compatible);
+    configuredPatternMatches = resourcePatternMatchesConfiguredValue(configured, compatible, spec);
+    [configuredChannelSet, configuredChannelSetMatches, configuredChannelSetMissing] = ...
+        resourceConfiguredChannelSetMatches(hasConfiguredRaw, configuredRaw, compatible, spec);
     status = 'resolved';
     autoChoice = resourceInventoryDef();
 
-    if ~isempty(configured)
-        status = 'resolved';
-        msg = sprintf('Node %s binds %s resource "%s" to %s.', ...
-            char(string(getField(node, 'id', ''))), char(string(spec.type)), configured, char(string(spec.param)));
+    if ~isempty(configuredChannelSet)
+        autoChoice = configuredChannelSetMatches;
+        if isempty(configuredChannelSetMissing)
+            msg = sprintf('Node %s binds %d channel resource(s) to %s.', ...
+                char(string(getField(node, 'id', ''))), numel(configuredChannelSet), char(string(spec.param)));
+        else
+            status = 'invalid';
+            msg = sprintf('Node %s binds channel resources to %s, but these value(s) are not available upstream: %s.', ...
+                char(string(getField(node, 'id', ''))), char(string(spec.param)), strjoin(configuredChannelSetMissing, ', '));
+        end
+    elseif ~isempty(configured)
+        if isChannelPatternSelector(configured)
+            if isempty(configuredPatternMatches)
+                status = 'invalid';
+                msg = sprintf('Node %s binds %s resource pattern "%s" to %s, but it matches no compatible upstream resource.', ...
+                    char(string(getField(node, 'id', ''))), char(string(spec.type)), configured, char(string(spec.param)));
+            else
+                autoChoice = configuredPatternMatches;
+                msg = sprintf('Node %s binds %s resource pattern "%s" to %s (%d match(es)).', ...
+                    char(string(getField(node, 'id', ''))), char(string(spec.type)), configured, char(string(spec.param)), numel(configuredPatternMatches));
+            end
+        else
+            msg = sprintf('Node %s binds %s resource "%s" to %s.', ...
+                char(string(getField(node, 'id', ''))), char(string(spec.type)), configured, char(string(spec.param)));
+        end
     elseif ~isempty(symbolic)
         symbolicChoice = findSymbolicResourceChoice(compatible, symbolic);
         if isempty(symbolicChoice)
@@ -1489,6 +1598,86 @@ function br = evaluateResourceInput(node, spec, availableResources, ctx)
     br.configured = configured;
     br.available = compatible;
     br.autoChoice = autoChoice;
+end
+
+function [names, matches, missing] = resourceConfiguredChannelSetMatches(hasRaw, raw, compatibleResources, spec)
+    names = {};
+    matches = resourceInventoryDef();
+    missing = {};
+    if ~hasRaw || ~strcmpi(char(string(getField(spec, 'type', ''))), 'channel')
+        return;
+    end
+    if isSymbolicResourceBinding(raw)
+        return;
+    end
+    names = normalizeChannelList(raw);
+    names = names(~isAllChannelSelectionCell(names));
+    if numel(names) <= 1
+        names = {};
+        return;
+    end
+
+    compatibleResources = normalizeResourceInventory(compatibleResources);
+    for i = 1:numel(names)
+        name = strtrim(char(string(names{i})));
+        if isempty(name)
+            continue;
+        end
+        one = findCompatibleResourceByConfiguredChannelName(name, compatibleResources);
+        if isempty(one)
+            missing{end+1} = name; %#ok<AGROW>
+        else
+            matches = mergeResourceInventory(matches, one); %#ok<AGROW>
+        end
+    end
+    missing = unique(missing, 'stable');
+end
+
+function match = findCompatibleResourceByConfiguredChannelName(name, compatibleResources)
+    match = resourceInventoryDef();
+    if isempty(name)
+        return;
+    end
+    if isChannelPatternSelector(name)
+        rx = channelPatternToRegexp(name);
+        for i = 1:numel(compatibleResources)
+            concreteName = strtrim(char(string(getField(compatibleResources(i), 'concreteName', ''))));
+            symbol = strtrim(char(string(getField(compatibleResources(i), 'symbol', ''))));
+            if (~isempty(concreteName) && ~isempty(regexp(concreteName, rx, 'once'))) || ...
+                    (~isempty(symbol) && ~isempty(regexp(symbol, rx, 'once')))
+                match(end+1) = compatibleResources(i); %#ok<AGROW>
+            end
+        end
+        return;
+    end
+    for i = 1:numel(compatibleResources)
+        concreteName = strtrim(char(string(getField(compatibleResources(i), 'concreteName', ''))));
+        symbol = strtrim(char(string(getField(compatibleResources(i), 'symbol', ''))));
+        if strcmpi(concreteName, name) || strcmpi(symbol, name)
+            match(end+1) = compatibleResources(i); %#ok<AGROW>
+        end
+    end
+end
+
+function matches = resourcePatternMatchesConfiguredValue(configured, compatibleResources, spec)
+    matches = resourceInventoryDef();
+    if isempty(configured) || ~strcmpi(char(string(getField(spec, 'type', ''))), 'channel')
+        return;
+    end
+    configured = strtrim(char(string(configured)));
+    if ~isChannelPatternSelector(configured)
+        return;
+    end
+    rx = channelPatternToRegexp(configured);
+    compatibleResources = normalizeResourceInventory(compatibleResources);
+    for i = 1:numel(compatibleResources)
+        concreteName = strtrim(char(string(getField(compatibleResources(i), 'concreteName', ''))));
+        symbol = strtrim(char(string(getField(compatibleResources(i), 'symbol', ''))));
+        if (~isempty(concreteName) && ~isempty(regexp(concreteName, rx, 'once'))) || ...
+                (~isempty(symbol) && ~isempty(regexp(symbol, rx, 'once')))
+            matches(end+1) = compatibleResources(i); %#ok<AGROW>
+        end
+    end
 end
 
 function rank = resourceStatusRank(status)
@@ -1773,10 +1962,11 @@ function [errors, warnings, artifactReport] = classifierArtifactIssues(node, ctx
                 artifactReport.status = 'missing_model';
                 return;
             end
-        case 'cellposesam'
-            % CellposeSAM may intentionally use the default SAM model when no
-            % package-local model file exists. The linked classi snapshot is
-            % sufficient for execution defaults.
+        case {'cellposesam','sam31'}
+            % Python-backed classifiers may intentionally use package-managed
+            % default weights or explicit checkpoint paths from their runtime
+            % config. The linked classi snapshot is sufficient for pipeline
+            % wiring; do not require a MATLAB <classifierId>.mat model file.
         otherwise
             modelPath = fullfile(modulePath, [moduleId '.mat']);
             artifactReport.modelPath = modelPath;
@@ -1821,6 +2011,145 @@ for i = 1:numel(outputKeys)
     if ~isempty(pathWarnings)
         warnings = [warnings, pathWarnings]; %#ok<AGROW>
     end
+end
+end
+
+function [errors, warnings, report] = pluginPackageIssues(node, ctx)
+errors = {};
+warnings = {};
+report = struct([]);
+
+nodeType = lower(char(string(getField(node, 'type', ''))));
+if ~any(strcmp(nodeType, {'processor','classifier'}))
+    return;
+end
+
+pkgName = char(string(getField(node, 'pkg', '')));
+p = getField(node, 'params', struct());
+if isempty(pkgName) && isstruct(p) && isfield(p, 'pkg') && ~isempty(p.pkg)
+    pkgName = char(string(p.pkg));
+end
+if isempty(pkgName)
+    return;
+end
+
+[customRoot, customDir] = customPackagePathsForValidation(node, p, pkgName);
+hasCustomLink = ~isempty(customRoot) || ~isempty(customDir);
+registeredDir = registeredPluginPackageDirForValidation(pkgName, nodeType);
+nodeId = char(string(getField(node, 'id', '')));
+
+if isempty(customDir) && ~isempty(customRoot)
+    customDir = fullfile(customRoot, ['+' pkgName]);
+end
+
+if hasCustomLink
+    configuredPath = customDir;
+    if isempty(configuredPath)
+        configuredPath = customRoot;
+    end
+    [checkPath, status, targetLabel, serverPath] = resolveNodePathForValidation(configuredPath, ctx);
+    accessible = ~isempty(checkPath) && exist(checkPath, 'dir') == 7;
+    report = pluginPackageReport(node, customRoot, customDir, checkPath, serverPath, status, targetLabel, registeredDir, accessible);
+
+    if accessible && ~packageFolderNameMatches(checkPath, pkgName)
+        errors{end+1} = sprintf('Plugin package for node %s points to "%s", but expected a folder named +%s.', ...
+            nodeId, checkPath, pkgName); %#ok<AGROW>
+        return;
+    end
+    if accessible
+        return;
+    end
+
+    msg = sprintf(['Plugin package for node %s is not accessible for %s. ' ...
+        'Configured package path: %s.'], nodeId, targetLabel, configuredPath);
+    if ~isempty(registeredDir)
+        msg = sprintf('%s A registered copy exists at %s; relink the plugin in pipeline2 so runs and exports use the portable path.', ...
+            msg, registeredDir);
+    else
+        msg = sprintf('%s Relink the plugin in pipeline2 or register/install the external plugin package.', msg);
+    end
+    errors{end+1} = msg; %#ok<AGROW>
+    return;
+end
+
+if ~isempty(registeredDir)
+    report = pluginPackageReport(node, customRoot, customDir, registeredDir, '', 'registered_unlinked', validationExecutionTargetLabel(ctx), registeredDir, true);
+    warnings{end+1} = sprintf(['Plugin package "%s" for node %s is available in the plugin registry (%s), ' ...
+        'but this pipeline node does not store a customPackageDir/customPackageRoot link. Relink it in pipeline2 before exporting a portable bundle.'], ...
+        pkgName, nodeId, registeredDir); %#ok<AGROW>
+end
+end
+
+function [customRoot, customDir] = customPackagePathsForValidation(node, params, pkgName)
+customRoot = '';
+customDir = '';
+if isfield(node, 'customPackageRoot') && ~isempty(node.customPackageRoot)
+    customRoot = char(string(node.customPackageRoot));
+end
+if isfield(node, 'customPackageDir') && ~isempty(node.customPackageDir)
+    customDir = char(string(node.customPackageDir));
+end
+if isstruct(params)
+    if isempty(customRoot) && isfield(params, 'customPackageRoot') && ~isempty(params.customPackageRoot)
+        customRoot = char(string(params.customPackageRoot));
+    end
+    if isempty(customDir) && isfield(params, 'customPackageDir') && ~isempty(params.customPackageDir)
+        customDir = char(string(params.customPackageDir));
+    end
+end
+if isempty(customDir) && ~isempty(customRoot) && ~isempty(pkgName)
+    customDir = fullfile(customRoot, ['+' pkgName]);
+end
+end
+
+function report = pluginPackageReport(node, configuredRoot, configuredDir, resolvedDir, serverPath, status, targetLabel, registeredDir, accessible)
+report = struct( ...
+    'nodeId', char(string(getField(node, 'id', ''))), ...
+    'type', char(string(getField(node, 'type', ''))), ...
+    'package', char(string(getField(node, 'pkg', ''))), ...
+    'configuredRoot', char(string(configuredRoot)), ...
+    'configuredDir', char(string(configuredDir)), ...
+    'resolvedDir', char(string(resolvedDir)), ...
+    'serverPath', char(string(serverPath)), ...
+    'registeredDir', char(string(registeredDir)), ...
+    'target', char(string(targetLabel)), ...
+    'status', char(string(status)), ...
+    'accessible', logical(accessible));
+end
+
+function tf = packageFolderNameMatches(folderPath, pkgName)
+tf = true;
+try
+    [~, leaf] = fileparts(char(string(folderPath)));
+    expected = ['+' char(string(pkgName))];
+    tf = strcmp(leaf, expected);
+catch
+    tf = true;
+end
+end
+
+function packageDir = registeredPluginPackageDirForValidation(pkgName, nodeType)
+packageDir = '';
+try
+    if exist('detecdiv_plugins_addpath', 'file') == 2
+        detecdiv_plugins_addpath();
+    end
+    if exist('detecdiv_plugins_list', 'file') ~= 2
+        return;
+    end
+    plugins = detecdiv_plugins_list();
+    for i = 1:numel(plugins)
+        if strcmp(char(string(plugins(i).name)), char(string(pkgName))) && ...
+                strcmpi(char(string(plugins(i).type)), char(string(nodeType)))
+            candidate = char(string(plugins(i).path));
+            if exist(candidate, 'dir') == 7
+                packageDir = candidate;
+                return;
+            end
+        end
+    end
+catch
+    packageDir = '';
 end
 end
 
@@ -1885,7 +2214,7 @@ end
 
 function tf = classifierRequiresLocalArtifacts(pkgName)
     pkgName = lower(char(string(pkgName)));
-    tf = ~any(strcmp(pkgName, {'cellposesam'}));
+    tf = ~any(strcmp(pkgName, {'cellposesam','sam31'}));
 end
 
 function msg = classifierRelinkMessage(nodeId, configuredPath, targetLabel, reason)
@@ -1978,7 +2307,18 @@ function [modulePath, status, targetLabel] = resolveClassifierModulePathForValid
             end
         end
     elseif isempty(modulePath)
-        modulePath = configuredPath;
+        pathText = char(string(configuredPath));
+        if ispc && startsWith(strrep(pathText, '\', '/'), '/')
+            [localPath, mapped] = mapHubServerPathToLocalPath(pathText, ctx);
+            if mapped
+                modulePath = localPath;
+                status = 'local_mirror';
+            else
+                modulePath = pathText;
+            end
+        else
+            modulePath = configuredPath;
+        end
     end
 
     if exist(modulePath, 'dir') ~= 7
@@ -2507,7 +2847,7 @@ function channels = resolveBindingConfiguredChannels(node, binding, selectors)
         if ~isfield(params, key) || isempty(params.(key))
             continue;
         end
-        channels = mergeKnownChannels(channels, normalizeConfiguredSelectionValue(params.(key)));
+        channels = mergeKnownChannels(channels, normalizeConfiguredOrSymbolicSelectionValue(params.(key)));
     end
     if ~isempty(channels)
         return;
@@ -2601,6 +2941,28 @@ function names = compatibleResourceConcreteNamesForBinding(node, resources)
         end
         compatible = findCompatibleResources(resources, spec);
         names = mergeKnownChannels(names, allResourceConcreteNames(compatible));
+        names = mergeKnownChannels(names, configuredCompatibleResourceNames(node, spec, compatible));
+    end
+end
+
+function names = configuredCompatibleResourceNames(node, spec, compatible)
+    names = {};
+    [hasRaw, raw] = resolveResourceRawValue(node, spec);
+    if ~hasRaw || isempty(raw) || isSymbolicResourceBinding(raw)
+        return;
+    end
+
+    rawNames = normalizeChannelList(raw);
+    rawNames = rawNames(~isAllChannelSelectionCell(rawNames));
+    for i = 1:numel(rawNames)
+        name = strtrim(char(string(rawNames{i})));
+        if isempty(name)
+            continue;
+        end
+        match = findCompatibleResourceByConfiguredChannelName(name, compatible);
+        if ~isempty(match)
+            names = mergeKnownChannels(names, {name}); %#ok<AGROW>
+        end
     end
 end
 
@@ -2700,6 +3062,16 @@ function channels = normalizeConfiguredSelectionValue(value)
     low = lower(channels);
     keep = ~strcmp(low, 'none') & ~strcmp(low, 'n/a') & ~isSymbolicChannelSelectionCell(channels);
     channels = channels(keep);
+end
+
+function channels = normalizeConfiguredOrSymbolicSelectionValue(value)
+    channels = normalizeConfiguredSelectionValue(value);
+    if ~isempty(channels)
+        return;
+    end
+    if isSymbolicResourceBinding(value) && ~isGenericSourceSymbolicBinding(value)
+        channels = {choiceToString(value)};
+    end
 end
 
 function tf = isAllChannelSelection(channels)
@@ -2849,7 +3221,7 @@ function names = normalizeChannelList(v)
     if ischar(v) || (isstring(v) && isscalar(v))
         s = char(string(v));
         if ~isempty(strtrim(s))
-            names = {s};
+            names = splitDelimitedNameList(s);
         end
         return;
     end
@@ -2865,7 +3237,7 @@ function names = normalizeChannelList(v)
                 continue;
             end
             try
-                tmp{end+1} = char(string(v{i})); %#ok<AGROW>
+                tmp = [tmp splitDelimitedNameList(char(string(v{i})))]; %#ok<AGROW>
             catch
             end
         end
@@ -2879,6 +3251,81 @@ function names = normalizeChannelList(v)
             names{end+1} = num2str(vals(i)); %#ok<AGROW>
         end
     end
+end
+
+function names = splitDelimitedNameList(s)
+    s = strtrim(char(string(s)));
+    if isempty(s)
+        names = {};
+        return;
+    end
+    parts = regexp(s, '[,;]+', 'split');
+    names = strtrim(parts);
+    names = names(~cellfun(@isempty, names));
+end
+
+function names = expandChannelPatternSelections(names, availableChannels)
+    names = normalizeChannelList(names);
+    availableChannels = normalizeChannelList(availableChannels);
+    if isempty(names) || isempty(availableChannels)
+        return;
+    end
+
+    expanded = {};
+    for i = 1:numel(names)
+        item = strtrim(char(string(names{i})));
+        if isChannelPatternSelector(item)
+            rx = channelPatternToRegexp(item);
+            matches = {};
+            for j = 1:numel(availableChannels)
+                candidate = char(string(availableChannels{j}));
+                if ~isempty(regexp(candidate, rx, 'once'))
+                    matches{end+1} = candidate; %#ok<AGROW>
+                end
+            end
+            if ~isempty(matches)
+                expanded = [expanded matches]; %#ok<AGROW>
+            else
+                expanded{end+1} = item; %#ok<AGROW>
+            end
+        else
+            expanded{end+1} = item; %#ok<AGROW>
+        end
+    end
+    names = unique(expanded, 'stable');
+end
+
+function tf = isChannelPatternSelector(value)
+    value = strtrim(char(string(value)));
+    if isempty(value) || any(strcmpi(value, {'all','*',':','<all>','@source','@roi','@all_channels'}))
+        tf = false;
+        return;
+    end
+    tf = contains(value, '$') || contains(value, '#') || contains(value, '*');
+end
+
+function rx = channelPatternToRegexp(pat)
+    pat = char(string(pat));
+    rx = '^';
+    i = 1;
+    while i <= numel(pat)
+        ch = pat(i);
+        if ch == '$' || ch == '#'
+            j = i;
+            while j <= numel(pat) && (pat(j) == '$' || pat(j) == '#')
+                j = j + 1;
+            end
+            rx = [rx '\d{' num2str(j - i) '}']; %#ok<AGROW>
+            i = j;
+        elseif ch == '*'
+            rx = [rx '.*']; %#ok<AGROW>
+            i = i + 1;
+        else
+            rx = [rx regexptranslate('escape', ch)]; %#ok<AGROW>
+            i = i + 1;
+        end
+    end
+    rx = [rx '$'];
 end
 
 function resources = initialResourceInventory(ctx, sem)
@@ -3043,6 +3490,7 @@ function name = normalizePhysicalResourceOutputName(node, spec, name)
     if isempty(name)
         return;
     end
+    name = strtrim(char(string(name)));
     nodeType = lower(char(string(getField(node, 'type', ''))));
     pkgName = lower(char(string(getField(node, 'pkg', ''))));
     if isempty(pkgName)
@@ -3053,7 +3501,11 @@ function name = normalizePhysicalResourceOutputName(node, spec, name)
     end
     resourceType = lower(char(string(getField(spec, 'type', ''))));
     role = lower(char(string(getField(spec, 'role', ''))));
-    if strcmp(nodeType, 'classifier') && strcmp(pkgName, 'cellposesam') && ...
+    if strcmp(nodeType, 'processor') && strcmp(pkgName, 'computemetrics') && ...
+            strcmp(resourceType, 'dataseries') && strcmp(role, 'metrics') && ...
+            ~isempty(regexp(name, '^processor_computemetrics(_\d+)?$', 'once'))
+        name = 'channel_quantification';
+    elseif strcmp(nodeType, 'classifier') && strcmp(pkgName, 'cellposesam') && ...
             strcmp(resourceType, 'mask') && strcmp(role, 'segmentation')
         name = cellposeSegmentationChannelNameLocal(node, name);
     elseif strcmp(nodeType, 'classifier') && strcmp(pkgName, 'deeplab_pixel_classification') && ...
@@ -3141,6 +3593,10 @@ function value = resolveResourceConfiguredValue(node, spec)
     if isSymbolicResourceBinding(raw)
         return;
     end
+    if strcmpi(char(string(getField(spec, 'type', ''))), 'channel') && isChannelPatternSelector(choiceToString(raw))
+        value = choiceToString(raw);
+        return;
+    end
     if ~isConfiguredResourceValue(raw)
         return;
     end
@@ -3214,7 +3670,9 @@ end
 
 function tf = isGenericSourceSymbolicBinding(v)
     s = lower(strtrim(choiceToString(v)));
-    tf = any(strcmp(s, {'@source','@sources','<source output>','<all source channels>'}));
+    tf = any(strcmp(s, {'@source','@sources','@z_stack','@z-stack', ...
+        '@z_stack output','@z-stack output', ...
+        '<source output>','<all source channels>','<z_stack output>','<z-stack output>'}));
 end
 
 function tf = isConfiguredResourceValue(v)
@@ -3283,8 +3741,31 @@ function tf = resourceSpecCompatible(wantedType, wantedRole, availableType, avai
     if tf
         return;
     end
+    tf = strcmp(wantedType, 'dataseriesvariable') && strcmp(availableType, 'dataseries') && ...
+        dataSeriesVariableRoleCompatible(wantedRole, availableRole);
+    if tf
+        return;
+    end
     tf = strcmp(wantedType, 'channel') && strcmp(wantedRole, 'mask_roi_image') && ...
         strcmp(availableType, 'mask') && strcmp(availableRole, 'segmentation');
+end
+
+function tf = dataSeriesVariableRoleCompatible(wantedRole, availableRole)
+    wantedRole = lower(char(string(wantedRole)));
+    availableRole = lower(char(string(availableRole)));
+    tf = false;
+    if isempty(wantedRole) || isempty(availableRole)
+        tf = true;
+        return;
+    end
+    switch wantedRole
+        case {'metric_variable','metrics_variable'}
+            tf = strcmp(availableRole, 'metrics');
+        case {'classification_label','classification_variable'}
+            tf = strcmp(availableRole, 'classification');
+        otherwise
+            tf = strcmp(wantedRole, availableRole);
+    end
 end
 
 function tf = resourceRolesCompatible(wantedRole, availableRole)
@@ -3303,6 +3784,10 @@ function tf = resourceRolesCompatible(wantedRole, availableRole)
         return;
     end
     if strcmp(wantedRole, 'roi_image')
+        tf = any(strcmp(availableRole, roiScorableChannelRoles()));
+        return;
+    end
+    if strcmp(wantedRole, 'z_stack')
         tf = any(strcmp(availableRole, roiScorableChannelRoles()));
         return;
     end
@@ -3512,6 +3997,7 @@ function sourceNode = symbolicResourceSourceNode(symbolicValue)
         parts = strsplit(symbolicValue, ':');
         if numel(parts) >= 3
             sourceNode = strtrim(parts{3});
+            sourceNode = dataSeriesNameFromVariableBinding(sourceNode);
         end
         return;
     end
@@ -3526,6 +4012,16 @@ function sourceNode = symbolicResourceSourceNode(symbolicValue)
     tokens = regexp(symbolicValue, 'output\s+from\s+([^/\s>]+)', 'tokens', 'once');
     if ~isempty(tokens)
         sourceNode = strtrim(tokens{1});
+    end
+end
+
+function seriesName = dataSeriesNameFromVariableBinding(value)
+    seriesName = strtrim(char(string(value)));
+    if contains(seriesName, '/')
+        parts = regexp(seriesName, '\s*/\s*', 'split');
+        if ~isempty(parts)
+            seriesName = strtrim(parts{1});
+        end
     end
 end
 
@@ -3729,6 +4225,9 @@ function available = initialAvailablePorts(ctx)
     end
     if any(strcmp(available, 'roiChannels')) && ~any(strcmp(available, 'channels'))
         available{end+1} = 'channels'; %#ok<AGROW>
+    end
+    if validationStartsFromExistingProject(ctx) && ~any(strcmp(available, 'roiList'))
+        available{end+1} = 'roiList'; %#ok<AGROW>
     end
     available = unique(available(:));
 end

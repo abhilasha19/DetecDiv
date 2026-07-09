@@ -10,6 +10,10 @@ function output = formatPixelTrainingSetCellTracktr(foldername, classif, trainro
 %   - layoutMode = "split_root" (your new requested layout):
 %       .../moma/train/CTC/<seq>/...
 %       .../moma/val/CTC/<seq>/...
+%   - datasetSubfolder = "" writes the same layout directly under
+%       .../<foldername>/...
+%     This is used by SAM3.1, whose Python preparation scripts expect a
+%     dataset root containing split/CTC directly.
 %
 % Usage:
 %   formatPixelTrainingSetCellTracktr(foldername, classif, trainrois, valrois)
@@ -27,6 +31,9 @@ p.addParameter('runQA', true, @(x)islogical(x) && isscalar(x));
 p.addParameter('qa_write_png', true, @(x)islogical(x) && isscalar(x));
 p.addParameter('qa_png_max_frames', 50, @(x)isnumeric(x) && isscalar(x));
 p.addParameter('qa_out_subdir', "_QA", @(s)ischar(s) || isstring(s));
+p.addParameter('runCocoConversion', true, @(x)islogical(x) && isscalar(x));
+p.addParameter('writeOverlayMovies', true, @(x)islogical(x) && isscalar(x));
+p.addParameter('datasetSubfolder', "moma", @(s)ischar(s) || isstring(s));
 
 p.parse(varargin{:});
 %mergeBudN = uint32(p.Results.mergeBudN);
@@ -39,6 +46,9 @@ runQA          = p.Results.runQA;
 qa_write_png   = p.Results.qa_write_png;
 qa_png_max     = p.Results.qa_png_max_frames;
 qa_out_subdir  = string(p.Results.qa_out_subdir);
+runCocoConversion = p.Results.runCocoConversion;
+writeOverlayMovies = p.Results.writeOverlayMovies;
+datasetSubfolder = strtrim(string(p.Results.datasetSubfolder));
 
 
 if ~ismember(layoutMode, ["ctc_root","split_root"])
@@ -56,7 +66,11 @@ layoutMode="split_root";  % train/CTC/01 etc....
 % =========================
 % Roots depending on layout
 % =========================
-momaRoot = fullfile(classif.path, foldername, 'moma');
+if datasetSubfolder == "" || datasetSubfolder == "."
+    momaRoot = fullfile(classif.path, foldername);
+else
+    momaRoot = fullfile(classif.path, foldername, char(datasetSubfolder));
+end
 if ~exist(momaRoot,'dir'), mkdir(momaRoot); end
 
 % mapping file location (single file for both splits)
@@ -499,11 +513,13 @@ totalBuds = totalBuds + nBuds;
         end
 
         % === Movie overlay (optionnel) : raw channel + overlay IDs (TRA)
-try
-    outMp4 = fullfile(splitBase, sprintf('%s_overlay.mp4', seqName));
-    makeOverlayMovieFromCTC(imgDir, traDir, outMp4, trackTable);
-catch ME
-    warning('Overlay movie failed for %s/%s: %s', splitName, seqName, ME.message);
+if writeOverlayMovies
+    try
+        outMp4 = fullfile(splitBase, sprintf('%s_overlay.mp4', seqName));
+        makeOverlayMovieFromCTC(imgDir, traDir, outMp4, trackTable);
+    catch ME
+        warning('Overlay movie failed for %s/%s: %s', splitName, seqName, ME.message);
+    end
 end
 
 
@@ -547,6 +563,10 @@ fprintf('🧬 TOTAL budding events (tous ROIs) : %d\n', totalBuds);
 % end
 
 % === Conversion COCO (optionnelle)
+if ~runCocoConversion
+    return;
+end
+
 % WARNING: depending on how create_coco_dataset_from_CTC.py discovers train/val,
 % the new layout may require adapting that script. I keep datapath=momaRoot.
 dataRoot = momaRoot;

@@ -1,8 +1,9 @@
 function layoutOut=score_updateLayout(layoutOptions,roiobj)
 
  roitmp = roiobj(1);
+score_applyDefaultChannelSelection(roitmp);
 if numel(roitmp.image) == 0
-    roitmp.load;
+    score_loadChannelsForDisplay(roitmp, []);
 end
 
 
@@ -31,6 +32,7 @@ dsC = roitmp.display;
 % On ne considère que les channels sélectionnés
 
 dsC = normalizeChannelSelectionForScore(dsC);
+dsC = normalizeChannelScaleForScore(dsC);
 
 selCh = find(dsC.selectedchannel);
 cmap=layoutOptions.colormap;
@@ -50,9 +52,11 @@ end
 if ~isempty(selCh)
     % Récupérer le nom des channels (cell array de chaînes)
     channels = dsC.channel(selCh);
+    channelLabels = localChannelLabels(dsC, selCh);
 
     % Pour chaque channel, construire un vecteur numérique [low high]
     levels = cell(1, numel(selCh));
+    displayLevels = cell(1, numel(selCh));
     for i = 1:numel(selCh)
         idx = selCh(i);
 
@@ -63,13 +67,20 @@ if ~isempty(selCh)
         if isempty(subIdx)
             subIdx = idx; % fallback
         end
-        lowVal  = round(65535 * dsC.displaylim(1, subIdx));
-        highVal = round(65535 * dsC.displaylim(2, subIdx));
+        lims = dsC.displaylim(:, subIdx);
+        if ~dsC.indexed(idx) && isDefaultDisplayLim(lims)
+            [lowVal, highVal] = autoDisplayLevelsFromImage(roitmp, subIdx);
+        else
+            lowVal  = round(65535 * lims(1));
+            highVal = round(65535 * lims(2));
+        end
 
         levels{i} = [lowVal, highVal];
+        displayLevels{i} = score_decodeChannelValues(roitmp, idx, [lowVal, highVal]);
 
         if dsC.indexed(idx)
             levels{i}={};
+            displayLevels{i}={};
             levels{i}{1}='-1';
             levels{i}{2}=cmap; 
             levels{i}{3}=dsC.alpha(idx);
@@ -77,23 +88,38 @@ if ~isempty(selCh)
             levels{i}{5}=dsC.width(idx);
         else
             levels{i} = [lowVal, highVal];
+            displayLevels{i} = score_decodeChannelValues(roitmp, idx, [lowVal, highVal]);
         end
     end
 
     % Construire pour chaque channel le vecteur RGB
     colors = cell(1, numel(selCh));
+    colorMode = cell(1, numel(selCh));
+    colormapName = cell(1, numel(selCh));
     for i = 1:numel(selCh)
         idx = selCh(i);
         colors{i} = dsC.rgb(idx, :);
+        colorMode{i} = localDisplayCellValue(dsC, 'colorMode', idx, 'rgb');
+        colormapName{i} = localDisplayCellValue(dsC, 'colormapName', idx, '');
     end
 
     % Construire les poids pour chaque channel en tant que vecteur numérique
     weights = dsC.alpha(selCh);  % Extraction directe sous forme numérique
 
     layoutOptions.channel=channels;
+    layoutOptions.channelLabel=channelLabels;
     layoutOptions.levels=levels;
+    layoutOptions.displayLevels=displayLevels;
     layoutOptions.RGB=colors;
+    layoutOptions.colorMode=colorMode;
+    layoutOptions.colormapName=colormapName;
     layoutOptions.weights=weights;
+    layoutOptions.scale=logical(dsC.scale(selCh));
+    if isfield(dsC, 'log') && ~isempty(dsC.log)
+        layoutOptions.log=logical(dsC.log(selCh));
+    else
+        layoutOptions.log=false(1, numel(selCh));
+    end
 end
 
 %% data specfic parameters
@@ -118,9 +144,23 @@ dataidx={};
 for j = 1:numel(layoutOptions.dataSelectedIdx)
     idx = layoutOptions.dataSelectedIdx(j);
     data = roitmp.data(idx);
+    nDataVars = localDataVariableCount(data);
 
     if numel( data.plotProperties)
-    subDataIdx = find(cellfun(@(x) x(:, 1) == true, data.plotProperties(:, 1)));
+    lineageRows = false(size(data.plotProperties, 1), 1);
+    try
+        if size(data.plotProperties, 2) >= 3
+            lineageRows = strcmp(string(data.plotProperties(:,3)), "lineageSource");
+        end
+        if isprop(data, 'groupid') && strcmp(char(string(data.groupid)), 'cell_information') && ...
+                size(data.plotProperties, 2) >= 2
+            lineageRows = lineageRows | strcmp(string(data.plotProperties(:,2)), "lineage");
+        end
+    catch
+        lineageRows = false(size(data.plotProperties, 1), 1);
+    end
+    validRows = (1:size(data.plotProperties, 1))' <= nDataVars;
+    subDataIdx = find(cellfun(@(x) x(:, 1) == true, data.plotProperties(:, 1)) & ~lineageRows & validRows);
     layoutOptions.subData(j) = {subDataIdx};
     ndata = ndata + numel(subDataIdx);
     
@@ -128,7 +168,7 @@ for j = 1:numel(layoutOptions.dataSelectedIdx)
     groups = data.plotGroup{6};
     for i = 1:numel(groups)
         pix = contains(data.plotProperties(:, end), string(groups{i}));
-        pix2 = cellfun(@(x) x(:, 1) == true, data.plotProperties(:, 1));
+        pix2 = cellfun(@(x) x(:, 1) == true, data.plotProperties(:, 1)) & ~lineageRows & validRows;
         pix = find(pix & pix2);  % indices des plots à afficher
         if ~isempty(pix)
             n = n + 1;
@@ -157,17 +197,39 @@ end
 % Comptage des canaux non-indexés
 nChannel = 0;
 nonIndexedNames = {};
+nonIndexedScale = [];
+nonIndexedLog = [];
+nonIndexedDisplayLevels = {};
 for j = 1:numel(layoutOptions.channel)
     if ~iscell(layoutOptions.levels{j})
         nChannel = nChannel + 1;
-        if iscell(layoutOptions.channel)
+        if isfield(layoutOptions, 'channelLabel') && numel(layoutOptions.channelLabel) >= j
+            nonIndexedNames{end+1} = layoutOptions.channelLabel{j};
+        elseif iscell(layoutOptions.channel)
             nonIndexedNames{end+1} = layoutOptions.channel{j};
         else
             nonIndexedNames{end+1} = layoutOptions.channel(j);
         end
+        if isfield(layoutOptions, 'scale') && numel(layoutOptions.scale) >= j
+            nonIndexedScale(end+1) = logical(layoutOptions.scale(j)); %#ok<AGROW>
+        else
+            nonIndexedScale(end+1) = false; %#ok<AGROW>
+        end
+        if isfield(layoutOptions, 'log') && numel(layoutOptions.log) >= j
+            nonIndexedLog(end+1) = logical(layoutOptions.log(j)); %#ok<AGROW>
+        else
+            nonIndexedLog(end+1) = false; %#ok<AGROW>
+        end
+        if isfield(layoutOptions, 'displayLevels') && numel(layoutOptions.displayLevels) >= j
+            nonIndexedDisplayLevels{end+1} = layoutOptions.displayLevels{j}; %#ok<AGROW>
+        else
+            nonIndexedDisplayLevels{end+1} = layoutOptions.levels{j}; %#ok<AGROW>
+        end
     end
 end
-if nChannel == 0  end
+layoutOptions.scale = logical(nonIndexedScale);
+layoutOptions.log = logical(nonIndexedLog);
+layoutOptions.displayLevels = nonIndexedDisplayLevels;
 
 %% layout parameters
 
@@ -176,6 +238,7 @@ if ~isempty(layoutOptions.crop)
     basesize(1) = layoutOptions.crop(3);
     basesize(2) = layoutOptions.crop(4);
 end
+
 if layoutOptions.scalingFactor ~= 1
     basesize(1) = basesize(1) * layoutOptions.scalingFactor;
     basesize(2) = basesize(2) * layoutOptions.scalingFactor;
@@ -189,6 +252,109 @@ layoutOptions.tileH = basesize(1);
 layoutOptions.tileW = basesize(2);
 layoutOptions.Nchannel=nChannel;
 layoutOut=layoutOptions;
+end
+
+function tf = isDefaultDisplayLim(lims)
+tf = false;
+try
+    tf = numel(lims) >= 2 && abs(double(lims(1))) < eps && abs(double(lims(2)) - 1) < eps;
+catch
+    tf = false;
+end
+end
+
+function [lowVal, highVal] = autoDisplayLevelsFromImage(roitmp, subIdx)
+lowVal = 0;
+highVal = 65535;
+try
+    vals = double(roitmp.image(:,:,subIdx,:));
+    vals = vals(:);
+    vals = vals(isfinite(vals));
+    if isempty(vals)
+        return;
+    end
+    lo = prctile(vals, 0.1);
+    hi = prctile(vals, 99.9);
+    if ~isfinite(lo) || ~isfinite(hi) || hi <= lo
+        lo = min(vals);
+        hi = max(vals);
+    end
+    if ~isfinite(lo) || ~isfinite(hi) || hi <= lo
+        hi = lo + 1;
+    end
+    lowVal = max(0, round(lo));
+    highVal = min(65535, max(lowVal + 1, round(hi)));
+catch
+    lowVal = 0;
+    highVal = 65535;
+end
+end
+
+function value = localDisplayCellValue(dsC, fieldName, idx, defaultValue)
+value = defaultValue;
+if ~isfield(dsC, fieldName) || isempty(dsC.(fieldName)) || idx > numel(dsC.(fieldName))
+    return;
+end
+try
+    value = char(string(dsC.(fieldName){idx}));
+catch
+    value = defaultValue;
+end
+end
+
+function n = localDataVariableCount(data)
+n = 0;
+try
+    if ~isprop(data, 'data') || isempty(data.data)
+        return;
+    end
+    if istable(data.data)
+        n = width(data.data);
+    elseif isstruct(data.data)
+        n = numel(fieldnames(data.data));
+    elseif iscell(data.data)
+        n = size(data.data, 2);
+    else
+        n = size(data.data, 2);
+    end
+catch
+    n = 0;
+end
+end
+
+function labels = localChannelLabels(dsC, selCh)
+labels = dsC.channel(selCh);
+if ~isfield(dsC, 'channelAlias') || isempty(dsC.channelAlias)
+    return;
+end
+try
+    for i = 1:numel(selCh)
+        idx = selCh(i);
+        if idx <= numel(dsC.channelAlias) && strlength(string(dsC.channelAlias{idx})) > 0
+            labels{i} = char(string(dsC.channelAlias{idx}));
+        end
+    end
+catch
+    labels = dsC.channel(selCh);
+end
+end
+
+function dsC = normalizeChannelScaleForScore(dsC)
+if ~isstruct(dsC) || ~isfield(dsC, 'channel') || isempty(dsC.channel)
+    return;
+end
+
+nCh = numel(dsC.channel);
+if ~isfield(dsC, 'scale') || isempty(dsC.scale)
+    dsC.scale = false(1, nCh);
+else
+    scale = logical(dsC.scale(:)');
+    scale = scale(1:min(numel(scale), nCh));
+    if numel(scale) < nCh
+        scale(end+1:nCh) = false;
+    end
+    dsC.scale = scale;
+end
 end
 
 function dsC = normalizeChannelSelectionForScore(dsC)

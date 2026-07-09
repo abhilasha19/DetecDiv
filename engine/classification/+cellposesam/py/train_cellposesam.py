@@ -2,6 +2,7 @@ import os
 import json
 import random
 import datetime
+import gc
 import numpy as np
 import h5py
 import torch
@@ -10,6 +11,28 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from cellpose import io, train, models
+
+
+def cuda_memory_info():
+    try:
+        free_bytes, total_bytes = torch.cuda.mem_get_info()
+        mib = 1024 ** 2
+        return f"free={free_bytes / mib:.0f} MiB, total={total_bytes / mib:.0f} MiB"
+    except Exception as exc:
+        return f"unavailable ({exc})"
+
+
+def cuda_reason_is_arch_mismatch(reason):
+    text = str(reason).lower()
+    return (
+        "not built for this gpu capability" in text
+        or "supported archs" in text
+        or "capability check failed" in text
+    )
+
+
+def cuda_reason_is_oom(reason):
+    return "out of memory" in str(reason).lower()
 
 
 def cuda_runtime_usable():
@@ -32,10 +55,26 @@ def cuda_runtime_usable():
         return False, f"CUDA capability check failed: {exc}"
 
     try:
+        gc.collect()
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            torch.cuda.ipc_collect()
+    except Exception as exc:
+        print(f"[WARN] CUDA cache cleanup before runtime test failed: {exc}")
+
+    print(f"[INFO] PyTorch CUDA memory before runtime test: {cuda_memory_info()}")
+    try:
         x = torch.ones((1,), device="cuda")
         _ = (x + 1).cpu().numpy()
     except Exception as exc:
-        return False, f"CUDA runtime test failed: {exc}"
+        reason = f"CUDA runtime test failed: {exc}"
+        if cuda_reason_is_oom(reason):
+            reason = (
+                f"{reason}. PyTorch CUDA memory after failure: {cuda_memory_info()}. "
+                "This usually means GPU memory is already occupied by another process "
+                "or by a persistent MATLAB/Python CUDA context."
+            )
+        return False, reason
 
     return True, ""
 
@@ -46,6 +85,35 @@ def load_config():
         raise RuntimeError("CPSAM_CONFIG env var not set.")
     with open(cfg_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def setup_cellpose_logger(model_name, verbose):
+    if not verbose:
+        return None
+
+    # Cellpose's default logger always unlinks ~/.cellpose/run.log. On
+    # Windows this fails if another MATLAB/Python Cellpose session still has
+    # that shared file open, so use a per-run log file instead.
+    safe_model = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(model_name))
+    log_name = f"run_{safe_model}_{datetime.datetime.now():%Y%m%d_%H%M%S}_{os.getpid()}.log"
+    try:
+        return io.logger_setup(logfile_name=log_name)
+    except PermissionError as exc:
+        print(f"[WARN] Cellpose logger setup failed ({exc}); continuing without Cellpose file logger.")
+        return None
+
+
+def write_status(status_path, payload):
+    if not status_path:
+        return
+    try:
+        tmp_path = f"{status_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp_path, status_path)
+        print("[INFO] training status saved to:", status_path)
+    except Exception as exc:
+        print("[WARN] could not save training status:", exc)
 
 
 def load_from_framebank(framebank_path, seed=None):
@@ -153,6 +221,7 @@ def train_model():
     framebank_path = cfg["framebank_path"]
     save_path = cfg["save_path"]
     model_name = cfg["model_name"]
+    status_path = cfg.get("status_path", "")
     seed = int(cfg.get("seed", 12345))
     use_pretrained = bool(cfg.get("use_pretrained", True))
     verbose = bool(cfg.get("verbose", True))
@@ -160,9 +229,18 @@ def train_model():
     if gpu:
         cuda_ok, cuda_reason = cuda_runtime_usable()
         if not cuda_ok:
+            if cuda_reason_is_arch_mismatch(cuda_reason):
+                advice = "Install a PyTorch wheel compatible with this GPU."
+            elif cuda_reason_is_oom(cuda_reason):
+                advice = (
+                    "Free GPU memory before relaunching training: close other GPU users, "
+                    "terminate the MATLAB Python session, reset MATLAB's GPU device, or run training on CPU."
+                )
+            else:
+                advice = "Check the active Python/PyTorch/CUDA runtime."
             raise RuntimeError(
-                "GPU training was requested but the active PyTorch/CUDA build is not usable. "
-                f"Reason: {cuda_reason}. Install a PyTorch wheel compatible with this GPU."
+                "GPU training was requested but CUDA is not usable. "
+                f"Reason: {cuda_reason}. {advice}"
             )
     if gpu and not torch.cuda.is_available():
         raise RuntimeError("GPU training was requested but torch.cuda.is_available() is false.")
@@ -173,8 +251,7 @@ def train_model():
     batch_size = int(cfg.get("batch_size", 1))
     min_train_masks = int(cfg.get("min_train_masks", 0))
 
-    if verbose:
-        io.logger_setup()
+    setup_cellpose_logger(model_name, verbose)
 
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
@@ -242,6 +319,20 @@ def train_model():
         print(f"[INFO] Best model path: {best_path}")
     else:
         print("[WARN] Could not determine best model (no losses).")
+
+    write_status(
+        status_path,
+        {
+            "status": "OK",
+            "model_path": str(model_path),
+            "best_model_path": str(best_path) if best_epoch is not None else "",
+            "best_epoch": int(best_epoch + 1) if best_epoch is not None else None,
+            "best_metric": float(best_metric) if best_metric is not None else None,
+            "metric_name": metric_name or "",
+            "n_train": len(imgs),
+            "n_val": len(val_imgs),
+        },
+    )
 
     if train_losses is not None and len(train_losses) > 0:
         epochs = np.arange(1, len(train_losses) + 1)

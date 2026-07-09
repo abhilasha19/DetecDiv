@@ -18,6 +18,7 @@ end
 
 if strcmpi(mode,"init") || strcmpi(mode,"setparam") || strcmpi(mode,"param")
     classif.trainingParam = cellposesam.utils.defaultTrainingParam();
+    cellposesam.ensureClassMetadata(classif);
     out.refs.trainingParam = classif.trainingParam;
     out.status = "OK";
     return;
@@ -26,12 +27,14 @@ end
 if isempty(classif.trainingParam)
     classif.trainingParam = cellposesam.utils.defaultTrainingParam();
 end
+cellposesam.ensureClassMetadata(classif);
 
 % Optional overrides from ctx.params
 if isfield(ctx,'params') && isstruct(ctx.params) && ~isempty(ctx.params)
     classif.trainingParam = cellposesam.utils.applyParamOverrides(classif.trainingParam, ctx.params);
 end
 
+detecdiv_check_cancel(ctx, 'cellposesam train start');
 runCellposeTrain(classif, ctx);
 
 out.status = "OK";
@@ -111,11 +114,19 @@ cfg.weight_decay   = trainingParam.weight_decay;
 cfg.learning_rate  = trainingParam.learning_rate;
 cfg.n_epochs       = trainingParam.n_epochs;
 cfg.batch_size     = trainingParam.batch_size;
+cfg.cancel_path    = cancelTokenFileFromCtx(ctx);
 
-% Keep legacy behavior (min_train_masks forced to 0 in training)
 cfg.min_train_masks = 0;
+if isfield(trainingParam, 'min_train_masks') && ~isempty(trainingParam.min_train_masks)
+    cfg.min_train_masks = max(0, round(double(trainingParam.min_train_masks)));
+end
 
 configPath = fullfile(classif.path, 'train_cellposesam_config.json');
+statusPath = fullfile(classif.path, 'train_cellposesam_status.json');
+if exist(statusPath, 'file') == 2
+    delete(statusPath);
+end
+cfg.status_path = strrep(statusPath, '\\', '/');
 fid = fopen(configPath, 'w');
 if fid == -1
     error('Unable to create Python config: %s', configPath);
@@ -131,7 +142,7 @@ disp(['[INFO] CellposeSAM config: ' configPath]);
 % Python environment & execution
 % -------------------------------------------------------------------------
 try
-    selectArgs = buildPythonSelectionArgsLocal(ctx, classif);
+    selectArgs = buildPythonSelectionArgsLocal(ctx);
     test = select_and_load_conda_env(selectArgs{:}); %#ok<NASGU>
 catch ME
     msg = ME.message;
@@ -152,7 +163,7 @@ else
     disp(['[INFO] Active Python env: ' python_env.Executable]);
 end
 
-function args = buildPythonSelectionArgsLocal(ctx, classif)
+function args = buildPythonSelectionArgsLocal(ctx)
 args = {'mode','default'};
 
 pyCfg = struct();
@@ -182,13 +193,13 @@ switch mode
         args = {'mode','custom'};
         try
             if isfield(pyCfg,'envName') && ~isempty(pyCfg.envName)
-                args = [args, {'envName', char(string(pyCfg.envName))}]; %#ok<AGROW>
+                args = [args, {'envName', char(string(pyCfg.envName))}];
             end
         catch
         end
         try
             if isfield(pyCfg,'envPath') && ~isempty(pyCfg.envPath)
-                args = [args, {'envPath', char(string(pyCfg.envPath))}]; %#ok<AGROW>
+                args = [args, {'envPath', char(string(pyCfg.envPath))}];
             end
         catch
         end
@@ -198,10 +209,291 @@ end
 end
 
 try
-    pyrunfile(scriptPath);
+    cancelPath = cancelTokenFileFromCtx(ctx);
+    detecdiv_check_cancel(ctx, 'cellposesam train before Python');
+    if ~isempty(cancelPath) && ~ispc
+        runPythonTrainingProcessWithCancel(char(python_env.Executable), scriptPath, configPath, classif.path, cancelPath);
+    else
+        runPythonTrainingWithCudaRecovery(scriptPath, selectArgs, classif, statusPath);
+    end
+    detecdiv_check_cancel(ctx, 'cellposesam train after Python');
     disp('[OK] CellposeSAM training finished successfully.');
 catch ME
     disp('[ERROR] during Python script execution.');
     disp(ME.message);
+    rethrow(ME);
+end
+end
+
+function runPythonTrainingWithCudaRecovery(scriptPath, selectArgs, classif, statusPath)
+% Retry once after stale MATLAB/Python CUDA contexts have been released.
+for attempt = 1:2
+    try
+        pyrunfile(scriptPath);
+        return;
+    catch ME
+        if isPythonTerminatedAfterCompletedTraining(ME, statusPath)
+            disp('[WARN] MATLAB Python host terminated after CellposeSAM saved the trained model.');
+            disp('[WARN] Training is considered complete; the Python host will be restarted on the next Python call.');
+            releaseMatlabGpuState();
+            try
+                terminate(pyenv);
+            catch
+            end
+            return;
+        end
+        if attempt == 1 && isRecoverableCudaPyenvFailure(ME)
+            disp('[WARN] CUDA memory failure detected during CellposeSAM training.');
+            disp('[WARN] Releasing MATLAB GPU state and restarting MATLAB Python host, then retrying once...');
+            releaseMatlabGpuState();
+            restartPythonHost(selectArgs, classif);
+            continue;
+        end
+        rethrow(ME);
+    end
+end
+end
+
+function runPythonTrainingProcessWithCancel(pythonExe, scriptPath, configPath, workDir, cancelPath)
+stdoutPath = fullfile(workDir, 'train_cellposesam_stdout.txt');
+stderrPath = fullfile(workDir, 'train_cellposesam_stderr.txt');
+statusPath = fullfile(workDir, 'train_cellposesam_runner_status.txt');
+scriptRunnerPath = fullfile(workDir, 'train_cellposesam_runner.sh');
+deleteIfExistsLocal(stdoutPath);
+deleteIfExistsLocal(stderrPath);
+deleteIfExistsLocal(statusPath);
+deleteIfExistsLocal(scriptRunnerPath);
+
+if ~isempty(cancelPath) && exist(cancelPath, 'file') == 2
+    error('runPipeline:Cancelled', 'Pipeline run cancelled by user before CellposeSAM training.');
+end
+
+cmd = sprintf('CPSAM_CONFIG=%s %s -u %s > %s 2> %s', ...
+    shellQuoteLocal(configPath), shellQuoteLocal(pythonExe), shellQuoteLocal(scriptPath), ...
+    shellQuoteLocal(stdoutPath), shellQuoteLocal(stderrPath));
+
+fid = fopen(scriptRunnerPath, 'w');
+if fid == -1
+    error('cellposesam:RunnerWriteFailed', 'Unable to write CellposeSAM training runner: %s', scriptRunnerPath);
+end
+cleanup = onCleanup(@() fclose(fid));
+fprintf(fid, '#!/usr/bin/env bash\n');
+fprintf(fid, 'set +e\n');
+fprintf(fid, 'cd %s\n', shellQuoteLocal(workDir));
+fprintf(fid, '%s\n', cmd);
+fprintf(fid, 'status=$?\n');
+fprintf(fid, 'printf "%%s\\n" "$status" > %s\n', shellQuoteLocal(statusPath));
+fprintf(fid, 'exit "$status"\n');
+clear cleanup
+
+launchCmd = sprintf('setsid bash %s < /dev/null & echo $!', shellQuoteLocal(scriptRunnerPath));
+[launchStatus, launchOut] = system(launchCmd);
+if launchStatus ~= 0
+    error('cellposesam:RunnerLaunchFailed', ...
+        'Unable to launch CellposeSAM training runner (%d):%s%s', launchStatus, newline, launchOut);
+end
+
+pid = strtrim(launchOut);
+if isempty(pid) || isnan(str2double(pid))
+    error('cellposesam:RunnerLaunchFailed', 'CellposeSAM training runner did not return a valid PID: %s', launchOut);
+end
+
+while true
+    if exist(statusPath, 'file') == 2
+        code = readExitCodeLocal(statusPath);
+        if code ~= 0
+            raiseTrainingProcessError(code, stdoutPath, stderrPath);
+        end
+        return;
+    end
+
+    if ~processExistsLocal(pid)
+        pause(0.5);
+        code = readExitCodeLocal(statusPath);
+        if code ~= 0
+            raiseTrainingProcessError(code, stdoutPath, stderrPath);
+        end
+        return;
+    end
+
+    if ~isempty(cancelPath) && exist(cancelPath, 'file') == 2
+        killProcessGroupLocal(pid);
+        error('runPipeline:Cancelled', 'Pipeline run cancelled by user during CellposeSAM training.');
+    end
+
+    pause(2);
+end
+end
+
+function raiseTrainingProcessError(code, stdoutPath, stderrPath)
+out = readTextFileLocal(stdoutPath);
+err = readTextFileLocal(stderrPath);
+msg = strtrim(string(err) + newline + string(out));
+if strlength(msg) == 0
+    msg = sprintf('Python runner exited with code %d.', code);
+end
+error('cellposesam:PythonRunnerFailed', 'CellposeSAM training failed (%d):%s%s', code, newline, char(msg));
+end
+
+function tf = isPythonTerminatedAfterCompletedTraining(ME, statusPath)
+msg = lower(string(ME.message));
+id = lower(string(ME.identifier));
+tf = contains(id, "pythonterminated") || contains(msg, "python process terminated unexpectedly");
+if tf
+    tf = trainingStatusShowsSuccess(statusPath);
+end
+end
+
+function tf = trainingStatusShowsSuccess(statusPath)
+tf = false;
+if isempty(statusPath) || exist(statusPath, 'file') ~= 2
+    return;
+end
+
+try
+    status = jsondecode(fileread(statusPath));
+catch
+    return;
+end
+
+if ~isfield(status, 'status') || ~strcmpi(char(string(status.status)), 'OK')
+    return;
+end
+
+paths = {};
+if isfield(status, 'model_path') && ~isempty(status.model_path)
+    paths{end+1} = char(string(status.model_path));
+end
+if isfield(status, 'best_model_path') && ~isempty(status.best_model_path)
+    paths{end+1} = char(string(status.best_model_path));
+end
+
+for iPath = 1:numel(paths)
+    if exist(paths{iPath}, 'file') == 2
+        tf = true;
+        return;
+    end
+end
+end
+
+function tf = isRecoverableCudaPyenvFailure(ME)
+msg = lower(string(ME.message));
+tf = contains(msg, "out of memory") || ...
+     contains(msg, "persistent matlab/python cuda context") || ...
+     contains(msg, "free gpu memory before relaunching training") || ...
+     contains(msg, "cuda runtime test failed");
+end
+
+function releaseMatlabGpuState()
+try
+    g = gpuDevice();
+    reset(g);
+    disp('[INFO] MATLAB GPU device reset completed.');
+catch ME
+    fprintf('[WARN] MATLAB GPU reset failed or unavailable: %s\n', ME.message);
+end
+end
+
+function restartPythonHost(selectArgs, classif)
+try
+    terminate(pyenv);
+    disp('[INFO] MATLAB Python host terminated.');
+catch ME
+    fprintf('[WARN] terminate(pyenv) failed or was unnecessary: %s\n', ME.message);
+end
+
+try
+    pause(1);
+catch
+end
+
+try
+    test = select_and_load_conda_env(selectArgs{:}); %#ok<NASGU>
+catch ME
+    error('cellposesam:PythonBootstrapFailedAfterCudaRecovery', ...
+        'Unable to reload Python after CUDA recovery:%s%s', newline, ME.message);
+end
+
+cellposesam.utils.ensurePythonDeps(classif);
+python_env = pyenv();
+if strcmp(python_env.Status, 'NotLoaded')
+    error('cellposesam:PythonNotLoadedAfterCudaRecovery', ...
+        'Python environment was not loaded after CUDA recovery.');
+end
+disp(['[INFO] Active Python env after recovery: ' python_env.Executable]);
+end
+
+function tokenFile = cancelTokenFileFromCtx(ctx)
+tokenFile = '';
+try
+    if isstruct(ctx) && isfield(ctx, 'cancel') && isstruct(ctx.cancel) ...
+            && isfield(ctx.cancel, 'tokenFile') && ~isempty(ctx.cancel.tokenFile)
+        tokenFile = char(string(ctx.cancel.tokenFile));
+    end
+catch
+    tokenFile = '';
+end
+end
+
+function deleteIfExistsLocal(pathValue)
+try
+    if exist(pathValue, 'file') == 2
+        delete(pathValue);
+    end
+catch
+end
+end
+
+function out = shellQuoteLocal(value)
+text = char(string(value));
+text = strrep(text, '''', '''"''"''');
+out = ['''' text ''''];
+end
+
+function code = readExitCodeLocal(statusPath)
+code = 1;
+try
+    if exist(statusPath, 'file') == 2
+        txt = strtrim(fileread(statusPath));
+        val = str2double(txt);
+        if ~isnan(val)
+            code = val;
+        end
+    end
+catch
+    code = 1;
+end
+end
+
+function text = readTextFileLocal(pathValue)
+text = '';
+try
+    if exist(pathValue, 'file') == 2
+        text = fileread(pathValue);
+    end
+catch
+    text = '';
+end
+end
+
+function tf = processExistsLocal(pid)
+tf = false;
+try
+    [status, ~] = system(sprintf('kill -0 %s 2>/dev/null', char(string(pid))));
+    tf = status == 0;
+catch
+    tf = false;
+end
+end
+
+function killProcessGroupLocal(pid)
+try
+    pgid = strtrim(char(string(pid)));
+    system(sprintf('kill -TERM -- -%s 2>/dev/null', pgid));
+    pause(5);
+    if processExistsLocal(pid)
+        system(sprintf('kill -KILL -- -%s 2>/dev/null', pgid));
+    end
+catch
 end
 end

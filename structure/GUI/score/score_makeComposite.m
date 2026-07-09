@@ -35,6 +35,8 @@ levels       = param.levels;
 rgb          = param.RGB;
 paintChannel = param.paintChannel;
 defaultClass = param.defaultClass;
+if isfield(param, 'colorMode'), colorMode = param.colorMode; else, colorMode = repmat({'rgb'}, 1, numel(channel)); end
+if isfield(param, 'colormapName'), colormapName = param.colormapName; else, colormapName = repmat({''}, 1, numel(channel)); end
 
 if isfield(param,'weights'), weights = param.weights; else, weights = []; end
 if ~isfield(param,'mode') || isempty(param.mode), param.mode = "display"; end
@@ -44,6 +46,14 @@ mode = lower(string(param.mode));  % "display", "sequence", "movie"
 % 0) REORDONNER LES CANAUX : non indexés d'abord, indexés ensuite
 % -------------------------------------------------------------------------
 nCh = numel(channel);
+colorMode = localPadCell(colorMode, nCh, 'rgb');
+colormapName = localPadCell(colormapName, nCh, '');
+if numel(rgb) < nCh
+    rgb(end+1:nCh) = repmat({[1 1 1]}, 1, nCh - numel(rgb));
+end
+if ~isempty(weights) && numel(weights) < nCh
+    weights(end+1:nCh) = 1;
+end
 isIndexedReq = false(1, nCh);
 for k = 1:nCh
     isIndexedReq(k) = iscell(levels{k});
@@ -54,6 +64,8 @@ if ~isequal(order, 1:nCh)
     channel = channel(order);
     levels  = levels(order);
     rgb     = rgb(order);
+    colorMode = colorMode(order);
+    colormapName = colormapName(order);
     if ~isempty(weights)
         weights = weights(order);
     end
@@ -63,6 +75,8 @@ end
 param.channel = channel;
 param.levels  = levels;
 param.RGB     = rgb;
+param.colorMode = colorMode;
+param.colormapName = colormapName;
 param.weights = weights;
 
 % -------------------------------------------------------------------------
@@ -109,35 +123,12 @@ for ch = 1:numel(channel)
     if isIndexed
         bgRGBu8 = [];
     else
-    % ---------------------------------------------------------------------
-    % 2a) Flag log-display (ROBUSTE)
-    %  - accepte roitmp.display.log scalaire OU vecteur
-    %  - IMPORTANT : indexation sur l'espace "image channel index" (currentCha)
-    % ---------------------------------------------------------------------
-    logdisplay = false;
-    if isprop(roitmp,'display') && isstruct(roitmp.display) && isfield(roitmp.display,'log') ...
-            && ~isempty(currentCha)
-
-        lf = roitmp.display.log;
-        chaIdx = currentCha(1); % index image (dimension 3)
-
-        if ~isempty(lf)
-            if isscalar(lf)
-                logdisplay = logical(lf);
-            else
-                if chaIdx >= 1 && chaIdx <= numel(lf)
-                    logdisplay = logical(lf(chaIdx));
-                else
-                    logdisplay = false;
-                end
-            end
-        end
-    end
+    logdisplay = localChannelFlag(param, 'log', ch, false);
 
     % ------------------------------------------------------------------
     % 2b) IMAGE DE FOND pour ce canal
     % ------------------------------------------------------------------
-    bg = double(imraw);
+    bg = normalizeIntensityImageForDisplay(imraw);
 
     if logdisplay
         bg = log1p(bg);
@@ -147,14 +138,14 @@ for ch = 1:numel(channel)
             lmin = log1p(double(levCh(1))) / log1p(65535);
             lmax = log1p(double(levCh(2))) / log1p(65535);
             if lmin >= lmax, lmin = lmax - 1e-3; end
-            bg = imadjust(bg, [lmin lmax]);
+            bg = adjustIntensityImage(bg, [lmin lmax]);
         end
     else
         if ~iscell(levCh) && ~isequal(levCh, [-1 -1])
             lo = levCh(1); hi = levCh(2);
             if lo >= hi, lo = hi - 1; end
-            bg16 = uint16(bg);
-            bg16 = imadjust(bg16, [lo/65535 hi/65535]);
+            bg16 = uint16(max(0, min(65535, bg)));
+            bg16 = adjustIntensityImage(bg16, [lo/65535 hi/65535]);
             bg   = double(bg16) / 65535;
         else
             maxv = max(bg(:));
@@ -170,32 +161,14 @@ for ch = 1:numel(channel)
     if ndims(bg) == 2
         gray = bg;
 
-        if logdisplay
-            n = 256;
-            cmap = parula2green(n);
-            idx = 1 + floor(gray*(n-1));
-            idx = min(max(idx,1), n);
-            bgRGB = ind2rgb(uint16(idx), cmap);
-        else
-            thisRGB = rgb{ch};
-            bgRGB = cat(3, gray*thisRGB(1), gray*thisRGB(2), gray*thisRGB(3));
-        end
+        bgRGB = localColorizeGray(gray, rgb{ch}, colorMode, colormapName, ch);
 
     elseif ndims(bg) == 3
         if size(bg,3) == 3
             bgRGB = bg;
         else
             gray = mean(bg,3);
-            if logdisplay
-                n = 256;
-                cmap = parula2green(n);
-                idx = 1 + floor(gray*(n-1));
-                idx = min(max(idx,1), n);
-                bgRGB = ind2rgb(uint16(idx), cmap);
-            else
-                thisRGB = rgb{ch};
-                bgRGB = cat(3, gray*thisRGB(1), gray*thisRGB(2), gray*thisRGB(3));
-            end
+            bgRGB = localColorizeGray(gray, rgb{ch}, colorMode, colormapName, ch);
         end
     else
         error('score_makeComposite: imraw dimension inattendue (%dD).', ndims(bg));
@@ -259,25 +232,17 @@ for ch = 1:numel(channel)
         listofindexedcha = [];
     end
 
-    % Filtre paintChannel
-    if ischar(paintChannel) || isstring(paintChannel)
-        if strlength(string(paintChannel)) > 0 && ~strcmpi(thisName, string(paintChannel))
-            continue;
-        end
-    else
-        if any(paintChannel ~= 0)
-            if isempty(currentIndx) || ~any(paintChannel == currentIndx)
-                continue;
-            end
-        end
-    end
-
     % indices par défaut
     if isempty(indices) || (numel(indices)==1 && indices==-1)
-        if defaultClass && ~isempty(currentIndx) && ~any(paintChannel == currentIndx)
-            indices = 2:max(L(:));
+        maxLabel = max(L(:));
+        if shouldHideIndexedBackgroundClass(defaultClass, currentIndx, paintChannel, thisName)
+            if maxLabel <= 1
+                indices = 1:maxLabel;
+            else
+                indices = 2:maxLabel;
+            end
         else
-            indices = 1:max(L(:));
+            indices = 1:maxLabel;
         end
     end
 
@@ -289,7 +254,9 @@ for ch = 1:numel(channel)
     end
 
     % couleurs
-    if isPaintThis
+    useLabelColors = isPaintThis;
+
+    if useLabelColors
         levmap = zeros(numel(indices), 3);
         for ii = 1:numel(indices)
             levmap(ii,:) = label2color(indices(ii));
@@ -307,7 +274,7 @@ for ch = 1:numel(channel)
     % paramètres overlay
     wid       = levCh{5};
     weiVal    = double(levCh{3});
-    fillAlpha = min(1, weiVal);
+    fillAlpha = min(1, max(0, weiVal));
 
     switch mode
         case {"sequence","movie"}
@@ -347,12 +314,8 @@ for ch = 1:numel(channel)
                 mask = (L == indices(iVal));
                 if ~any(mask(:)), continue; end
 
-                for c = 1:3
-                    tmp = indexedOverlay(:,:,c);
-                    tmp(mask) = levmap(iVal,c);
-                    indexedOverlay(:,:,c) = tmp;
-                end
-                alphaOverlay(mask) = fillAlpha;
+                [indexedOverlay, alphaOverlay] = compositeOverlayLayer( ...
+                    indexedOverlay, alphaOverlay, mask, levmap(iVal,:), fillAlpha);
             end
     end
 
@@ -366,8 +329,127 @@ end
 end % score_makeComposite
 
 % -------------------------------------------------------------------------
-% Helper: map tmpcha (ID canal) -> dispIdx (index sûr pour roitmp.display.*)
+% Helpers
 % -------------------------------------------------------------------------
+function img = normalizeIntensityImageForDisplay(img)
+img = double(img);
+
+if ndims(img) <= 2
+    return;
+end
+
+if size(img, 3) == 1
+    img = img(:, :, 1);
+elseif size(img, 3) ~= 3
+    img = max(img, [], 3);
+end
+end
+
+function [rgbOut, alphaOut] = compositeOverlayLayer(rgbIn, alphaIn, mask, color, alpha)
+% Composite one semi-transparent annotation layer onto an accumulated RGBA.
+% This preserves overlapping annotation channels instead of letting the
+% last channel overwrite the color/alpha of previous channels.
+
+rgbOut = rgbIn;
+alphaOut = alphaIn;
+
+alpha = min(1, max(0, double(alpha)));
+if alpha <= 0 || ~any(mask(:))
+    return;
+end
+
+color = double(color(:)');
+if numel(color) ~= 3
+    color = [1 1 1];
+end
+color = min(1, max(0, color));
+
+oldAlpha = alphaOut(mask);
+newAlpha = alpha + oldAlpha .* (1 - alpha);
+safeAlpha = max(newAlpha, eps);
+
+for c = 1:3
+    plane = rgbOut(:,:,c);
+    oldColor = plane(mask);
+    plane(mask) = (color(c) .* alpha + oldColor .* oldAlpha .* (1 - alpha)) ./ safeAlpha;
+    rgbOut(:,:,c) = plane;
+end
+
+alphaOut(mask) = newAlpha;
+end
+
+function img = adjustIntensityImage(img, lims)
+if ndims(img) <= 2 || size(img, 3) == 1
+    img = imadjust(img(:, :, 1), lims);
+    return;
+end
+
+if size(img, 3) ~= 3
+    img = imadjust(max(img, [], 3), lims);
+    return;
+end
+
+for k = 1:3
+    img(:, :, k) = imadjust(img(:, :, k), lims);
+end
+end
+
+function value = localChannelFlag(param, fieldName, ch, defaultValue)
+value = defaultValue;
+if ~isfield(param, fieldName) || isempty(param.(fieldName))
+    return;
+end
+
+flags = param.(fieldName);
+try
+    if isscalar(flags)
+        value = logical(flags);
+    elseif ch >= 1 && ch <= numel(flags)
+        value = logical(flags(ch));
+    end
+catch
+    value = defaultValue;
+end
+end
+
+function values = localPadCell(values, n, defaultValue)
+if isempty(values)
+    values = repmat({defaultValue}, 1, n);
+elseif isstring(values)
+    values = cellstr(values(:).');
+elseif ischar(values)
+    values = {values};
+elseif ~iscell(values)
+    values = repmat({defaultValue}, 1, n);
+end
+if numel(values) < n
+    values(end+1:n) = {defaultValue};
+elseif numel(values) > n
+    values = values(1:n);
+end
+end
+
+function bgRGB = localColorizeGray(gray, rgb, colorMode, colormapName, ch)
+mode = 'rgb';
+if ch <= numel(colorMode) && ~isempty(colorMode{ch})
+    mode = lower(strtrim(char(string(colorMode{ch}))));
+end
+
+if strcmp(mode, 'colormap')
+    cmapName = 'parula';
+    if ch <= numel(colormapName) && strlength(string(colormapName{ch})) > 0
+        cmapName = char(string(colormapName{ch}));
+    end
+    cmap = score_colormapFromName(cmapName, 256);
+    idx = 1 + floor(min(max(gray, 0), 1) * (size(cmap, 1) - 1));
+    idx = min(max(idx, 1), size(cmap, 1));
+    bgRGB = ind2rgb(idx, cmap);
+else
+    thisRGB = min(max(double(rgb), 0), 1);
+    bgRGB = cat(3, gray*thisRGB(1), gray*thisRGB(2), gray*thisRGB(3));
+end
+end
+
 function dispIdx = getDisplayIndex(roitmp, tmpcha, channel, ch)
 
 dispIdx = tmpcha; % cas simple si aligné
@@ -400,6 +482,27 @@ dispIdx = min(max(1, dispIdx), nDisp);
 
 end
 
+function tf = shouldHideIndexedBackgroundClass(defaultClass, currentIndx, paintChannel, channelName)
+tf = false;
+try
+    isPaintThis = false;
+    if ischar(paintChannel) || isstring(paintChannel)
+        isPaintThis = strlength(string(paintChannel)) > 0 && strcmpi(string(channelName), string(paintChannel));
+    else
+        isPaintThis = any(paintChannel ~= 0) && ~isempty(currentIndx) && any(paintChannel == currentIndx);
+    end
+    if isPaintThis
+        return;
+    end
+
+    % Let the UI checkbox decide whether label 1 is background. Classifier
+    % result channels may legitimately use object id 1 for a real cell.
+    tf = logical(defaultClass);
+catch
+    tf = logical(defaultClass);
+end
+end
+
 
 
 
@@ -414,10 +517,10 @@ imageSize=param.imageSize;
 flip=param.flip;
 
 if isempty(roitmp.image)
-    roitmp.load;
+    score_loadChannelsForDisplay(roitmp, channel);
 elseif ~isempty(roitmp.channelid)
     if size(roitmp.image,3) ~= numel(roitmp.channelid) || max(roitmp.channelid) > size(roitmp.image,3)
-        roitmp.load;
+        score_loadChannelsForDisplay(roitmp, channel);
     end
 end
 

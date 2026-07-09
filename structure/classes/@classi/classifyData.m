@@ -179,7 +179,7 @@ else
 end
 
 % Channel list expansion if user forced "classify all ROIs"
-if numel(channel) < numel(roiobj) && numel(channel) > 0
+if iscell(channel) && numel(channel) < numel(roiobj) && numel(channel) > 0
     channel(numel(channel)+1:numel(roiobj)) = {channel{end}};
 end
 
@@ -204,6 +204,7 @@ for i = 1:numel(roiobj)
     disp(['[DEBUG] classifyData: ROI ' num2str(i) '/' num2str(numel(roiobj)) ' id=' roiIdStr]);
     hadImageInMemory = ~isempty(roiobj(i).image);
     hadDataInMemory = ~isempty(roiobj(i).data);
+    ensureRequiredChannelsLoadedLocal(roiobj(i), ctxBase, channelForRoiLocal(channel, i));
     if para
         hadImageByIdx(i) = hadImageInMemory;
         hadDataByIdx(i) = hadDataInMemory;
@@ -264,7 +265,7 @@ for i = 1:numel(roiobj)
     % ---------------------------------------------------------
     if isempty(roiobj(i).image)
         disp(['[DEBUG] classifyData: ROI ' roiIdStr ' has empty image -> loading']);
-        roiobj(i).load;
+        loadRoiImageForClassificationLocal(roiobj(i), ctxBase, channelForRoiLocal(channel, i));
     end
     if isempty(roiobj(i).image)
         warning(['ROI is empty; skipping... (ROI ' roiIdStr ')']);
@@ -318,8 +319,13 @@ for i = 1:numel(roiobj)
             cha = classiobj.channelName;
         end
     else
-        cha = channel{i};
+        cha = channelForRoiLocal(channel, i);
+        if iscell(cha) && numel(cha) == 1
+            cha = cha{1};
+        end
     end
+    cha = resolveClassificationChannelsLocal(roiobj(i), classiobj, cha);
+    ensureChannelIndicesAddressableLocal(roiobj(i), cha);
     try
         if iscell(cha)
             chaStr = strjoin(cha, ',');
@@ -377,7 +383,7 @@ for i = 1:numel(roiobj)
                 catch
                     disp('[DEBUG] classifyData: using roiApplyPatch for ROI (id unavailable)');
                 end
-                applyAndPersistClassifierPatch(roiobj(i), out.patch, ctx, outputName, cachePolicy, hadImageInMemory, hadDataInMemory, saveMode);
+                applyAndPersistClassifierPatch(roiobj(i), out.patch, ctx, outputName, classiobj, cachePolicy, hadImageInMemory, hadDataInMemory, saveMode);
             else
                 if exist('roiApplyPatch','file') ~= 2
                     warning('roiApplyPatch not found on path; falling back to ROIManagement.');
@@ -390,7 +396,7 @@ for i = 1:numel(roiobj)
                 catch
                     disp('[DEBUG] classifyData: using ROIManagement for ROI (id unavailable)');
                 end
-                    ROIManagement(roiobj(i), out.data, out.image, outputName, classiobj, cachePolicy, hadImageInMemory, hadDataInMemory, saveMode);
+                    ROIManagement(roiobj(i), out.data, out.image, outputName, classiobj, cachePolicy, hadImageInMemory, hadDataInMemory, saveMode, ctx);
                 end
             end
             disp(['Classified (pipeline) ' num2str(roiobj(i).id)]);
@@ -436,7 +442,7 @@ if para
                 catch
                     disp('[DEBUG] classifyData: using roiApplyPatch for ROI (id unavailable)');
                 end
-                applyAndPersistClassifierPatch(roiobj(idx), out.patch, ctx, outputName, cachePolicy, hadImageByIdx(idx), hadDataByIdx(idx), saveMode);
+                applyAndPersistClassifierPatch(roiobj(idx), out.patch, ctx, outputName, classiobj, cachePolicy, hadImageByIdx(idx), hadDataByIdx(idx), saveMode);
             else
                 if exist('roiApplyPatch','file') ~= 2
                     warning('roiApplyPatch not found on path; falling back to ROIManagement.');
@@ -449,7 +455,7 @@ if para
                     catch
                         disp('[DEBUG] classifyData: using ROIManagement for ROI (id unavailable)');
                     end
-                    ROIManagement(roiobj(idx), out.data, out.image, outputName, classiobj, cachePolicy, hadImageByIdx(idx), hadDataByIdx(idx), saveMode);
+                    ROIManagement(roiobj(idx), out.data, out.image, outputName, classiobj, cachePolicy, hadImageByIdx(idx), hadDataByIdx(idx), saveMode, ctx);
                 end
             end
         else
@@ -614,18 +620,29 @@ function ROIpreprocessing(roiobj, classif, outputName)
 
     % --- Detect instance segmentation types
     isCPSAM = false;
+    isSAM31 = false;
 
-    if isprop(classif,'classifyFun') && strcmp(classif.classifyFun,'classifyCPSAMFun')
+    if isprop(classif,'classifierPkg') && strcmpi(char(string(classif.classifierPkg)), 'cellposesam')
         isCPSAM = true;
+    elseif isprop(classif,'classifierPkg') && strcmpi(char(string(classif.classifierPkg)), 'sam31')
+        isSAM31 = true;
+    elseif isprop(classif,'classifyFun') && any(strcmpi(char(string(classif.classifyFun)), {'classifyCPSAMFun','cellposesam.classify'}))
+        isCPSAM = true;
+    elseif isprop(classif,'classifyFun') && any(strcmpi(char(string(classif.classifyFun)), {'sam31.classify'}))
+        isSAM31 = true;
     elseif isprop(classif,'description') && ~isempty(classif.description)
-        isCPSAM = any(strcmp(classif.description, 'CellposeSAM'));
+        desc = lower(string(classif.description));
+        isCPSAM = any(contains(desc, 'cellpose'));
+        isSAM31 = any(contains(desc, 'sam31')) || any(contains(desc, 'sam3'));
     end
 
     isInstanceSeg = (strcmp(classif.description{1}, 'YOLO instance segmentation') || ...
                      strcmp(classif.description{1}, 'Cell-TRACKTR')               || ...
-                     isCPSAM);
+                     isCPSAM || isSAM31);
 
     if isInstanceSeg
+        localDropChannelIfPresent(roiobj, ['results_' char(outputName)]);
+
         for c = 1:numel(classif.classes)
             chname      = ['results_' char(outputName) '_' classif.classes{c}];
             rgb         = [1 1 1];
@@ -634,7 +651,7 @@ function ROIpreprocessing(roiobj, classif, outputName)
             ensureResultChannel(roiobj, chname, rgb, intensity, indexedFlag, nY, nX, nF);
         end
 
-        if isCPSAM && isprop(classif,'outputType') && strcmp(classif.outputType, 'proba')
+        if isCPSAM && localClassiWantsProbabilityOutput(classif)
             chNameProba = [char(outputName) '_cellprob'];
             pixproba = findChannelID(roiobj, chNameProba);
             if isempty(pixproba)
@@ -643,6 +660,13 @@ function ROIpreprocessing(roiobj, classif, outputName)
                 pixproba = size(roiobj.image,3);
             end
             enforceResultChannelDisplay(roiobj, pixproba, [1 0 1], [1 1 1], false);
+        elseif isCPSAM
+            localDropChannelIfPresent(roiobj, 'results');
+            localDropChannelIfPresent(roiobj, ['results_' char(outputName)]);
+            localDropChannelIfPresent(roiobj, [char(outputName) '_cellprob']);
+            for c = 1:numel(classif.classes)
+                localDropChannelIfPresent(roiobj, ['prob_' char(outputName) '_' classif.classes{c}]);
+            end
         end
 
         return;
@@ -687,6 +711,17 @@ function ROIpreprocessing(roiobj, classif, outputName)
     end
 end
 
+
+function localDropChannelIfPresent(roiobj, channelName)
+try
+    if ~isempty(findChannelID(roiobj, channelName))
+        roiobj.removeChannel(channelName);
+    end
+catch ME
+    warning('classifyData:DropProbabilityChannelFailed', ...
+        'Could not drop stale probability channel "%s": %s', channelName, ME.message);
+end
+end
 
 function ensureResultChannel(roiobj, chname, rgb, intensity, indexedFlag, nY, nX, nF)
     pixid = findChannelID(roiobj, chname);
@@ -754,7 +789,7 @@ end
 % ROI management + saving
 %   NEW: apply outputName to dataseries.groupid (NO HEURISTICS)
 % ========================================================================
-function ROIManagement(roiobj, data, image, outputName, classiobj, cachePolicyLocal, hadImageBefore, hadDataBefore, saveMode)
+function ROIManagement(roiobj, data, image, outputName, classiobj, cachePolicyLocal, hadImageBefore, hadDataBefore, saveMode, ctx)
 
     % --- Only re-group classification outputs that belong to this classifier ---
     if nargin >= 5 && ~isempty(outputName) && isa(data,'dataseries')
@@ -766,15 +801,24 @@ function ROIManagement(roiobj, data, image, outputName, classiobj, cachePolicyLo
     if nargin < 7, hadImageBefore = false; end
     if nargin < 8, hadDataBefore = false; end
     if nargin < 9 || isempty(saveMode), saveMode = 'immediate'; end
+    if nargin < 10 || isempty(ctx), ctx = struct(); end
 
     imageCache = image;
     dataCache = data;
     roiobj.data  = data;
     roiobj.image = image;
     localNormalizeIndexedResultChannels(roiobj);
+    lineageDataChanged = maybeApplyPostClassifierLineageLocal(roiobj, classiobj, outputName, ctx);
+    if lineageDataChanged
+        dataCache = roiobj.data;
+    end
 
     if shouldDeferSaveLocal(saveMode)
-        markDeferredDirtyLocal(roiobj, true, numel(image) > 0);
+        imageSaveChannels = {};
+        if numel(image)
+            imageSaveChannels = localClassifierImageOutputChannels(roiobj, outputName, classiobj);
+        end
+        markDeferredDirtyLocal(roiobj, true, numel(image) > 0, imageSaveChannels);
         disp('[DEBUG] ROIManagement: defer save requested, ROI kept in memory.');
         return;
     end
@@ -790,6 +834,11 @@ function ROIManagement(roiobj, data, image, outputName, classiobj, cachePolicyLo
             try
                 disp(['[DEBUG] ROIManagement: saving classifier output channels only: ' strjoin(imageSaveChannels, ', ')]);
             catch
+            end
+            if lineageDataChanged
+                roiobj.data = dataCache;
+                roiobj.save('data');
+                roiobj.image = imageCache;
             end
             roiobj.save(imageSaveChannels);
         else
@@ -819,23 +868,26 @@ function ROIManagement(roiobj, data, image, outputName, classiobj, cachePolicyLo
     end
 end
 
-function applyAndPersistClassifierPatch(roiobj, patch, ctx, outputName, cachePolicyLocal, hadImageBefore, hadDataBefore, saveMode)
-    if nargin < 5 || isempty(cachePolicyLocal)
+function applyAndPersistClassifierPatch(roiobj, patch, ctx, outputName, classiobj, cachePolicyLocal, hadImageBefore, hadDataBefore, saveMode)
+    if nargin < 6 || isempty(cachePolicyLocal)
         cachePolicyLocal = 'auto';
     end
-    if nargin < 6, hadImageBefore = false; end
-    if nargin < 7, hadDataBefore = false; end
-    if nargin < 8 || isempty(saveMode), saveMode = 'immediate'; end
+    if nargin < 7, hadImageBefore = false; end
+    if nargin < 8, hadDataBefore = false; end
+    if nargin < 9 || isempty(saveMode), saveMode = 'immediate'; end
 
     imageCache = roiobj.image;
     dataCacheBefore = roiobj.data;
     roiApplyPatch(roiobj, patch, ctx);
+    lineageDataChanged = maybeApplyPostClassifierLineageLocal(roiobj, classiobj, outputName, ctx);
+    dataCacheAfter = roiobj.data;
 
-    hasDataPatch = patchHasDataseries(patch);
+    patchDataChanged = patchHasDataseries(patch);
+    hasDataPatch = patchDataChanged || lineageDataChanged;
     hasImagePatch = patchHasImageWrite(patch);
     expectedOutput = char(string(outputName));
 
-    if hasDataPatch && ~roiHasDataseries(roiobj, expectedOutput)
+    if patchDataChanged && ~roiHasDataseries(roiobj, expectedOutput)
         error('classifyData:MissingPatchOutput', ...
             'Classifier patch did not create expected dataseries "%s" for ROI "%s".', ...
             expectedOutput, safeRoiIdLocal(roiobj));
@@ -847,7 +899,11 @@ function applyAndPersistClassifierPatch(roiobj, patch, ctx, outputName, cachePol
                 'Classifier patch contained no image or dataseries output for ROI "%s".', ...
                 safeRoiIdLocal(roiobj));
         end
-        markDeferredDirtyLocal(roiobj, hasDataPatch, hasImagePatch);
+        channelsToSave = {};
+        if hasImagePatch
+            channelsToSave = patchImageChannels(patch);
+        end
+        markDeferredDirtyLocal(roiobj, hasDataPatch, hasImagePatch, channelsToSave);
         disp('[DEBUG] classifyData: defer save requested, classifier patch kept in memory.');
         return;
     end
@@ -855,6 +911,11 @@ function applyAndPersistClassifierPatch(roiobj, patch, ctx, outputName, cachePol
     if hasImagePatch
         channelsToSave = patchImageChannels(patch);
         if ~isempty(channelsToSave) && localRoiH5Exists(roiobj)
+            if lineageDataChanged
+                roiobj.data = dataCacheAfter;
+                roiobj.save('data');
+                roiobj.image = imageCache;
+            end
             roiobj.save(channelsToSave);
         else
             roiobj.save;
@@ -882,9 +943,119 @@ function applyAndPersistClassifierPatch(roiobj, patch, ctx, outputName, cachePol
             try
                 roiobj.load('data','Silent');
             catch
-                roiobj.data = dataCacheBefore;
+                roiobj.data = dataCacheAfter;
             end
         end
+    end
+end
+
+function changed = maybeApplyPostClassifierLineageLocal(roiobj, classiobj, outputName, ctx)
+    changed = false;
+    if ~localIsSam31Classifier(classiobj)
+        return;
+    end
+    if ~localClassifierBoolParam(classiobj, ctx, {'inferBudPairing','runBudPairing','enableBudPairing'}, true)
+        return;
+    end
+    try
+        report = sam31.applyBudPairing(roiobj, classiobj, 'OutputName', outputName, 'Ctx', ctx);
+        if isstruct(report) && isfield(report, 'changed')
+            changed = logical(report.changed);
+        end
+        if isstruct(report) && isfield(report, 'reason') && ~strcmp(char(string(report.reason)), 'disabled')
+            try
+                fprintf('[SAM31 bud pairing] ROI %s: %s, events=%d, assigned=%d\n', ...
+                    safeRoiIdLocal(roiobj), char(string(report.reason)), ...
+                    localStructNumber(report, 'nEvents', 0), ...
+                    localStructNumber(report, 'nAssignedToMotherOf', 0));
+            catch
+            end
+        end
+    catch ME
+        warning('classifyData:SAM31BudPairingFailed', ...
+            'SAM31 bud-mother pairing failed for ROI "%s": %s', ...
+            safeRoiIdLocal(roiobj), ME.message);
+    end
+end
+
+function tf = localIsSam31Classifier(classiobj)
+    tf = false;
+    try
+        if isprop(classiobj, 'classifierPkg') && strcmpi(char(string(classiobj.classifierPkg)), 'sam31')
+            tf = true;
+            return;
+        end
+    catch
+    end
+    try
+        if isprop(classiobj, 'classifyFun')
+            fun = char(string(classiobj.classifyFun));
+            tf = contains(lower(fun), 'sam31.classify');
+        end
+    catch
+        tf = false;
+    end
+end
+
+function value = localStructNumber(s, fieldName, fallback)
+    value = fallback;
+    try
+        if isstruct(s) && isfield(s, fieldName)
+            value = double(s.(fieldName));
+        end
+    catch
+        value = fallback;
+    end
+end
+
+function tf = localClassifierBoolParam(classiobj, ctx, names, defaultValue)
+    tf = defaultValue;
+    sources = {};
+    try
+        if isstruct(ctx) && isfield(ctx, 'params') && isstruct(ctx.params)
+            sources{end+1} = ctx.params; %#ok<AGROW>
+        end
+    catch
+    end
+    try
+        if isprop(classiobj, 'runProfiles') && isstruct(classiobj.runProfiles) && ...
+                isfield(classiobj.runProfiles, 'classify') && ...
+                isfield(classiobj.runProfiles.classify, 'params') && ...
+                isstruct(classiobj.runProfiles.classify.params)
+            sources{end+1} = classiobj.runProfiles.classify.params; %#ok<AGROW>
+        end
+    catch
+    end
+    for s = 1:numel(sources)
+        src = sources{s};
+        fields = fieldnames(src);
+        for n = 1:numel(names)
+            hit = find(strcmpi(fields, names{n}), 1, 'first');
+            if ~isempty(hit)
+                tf = localValueToBool(src.(fields{hit}), defaultValue);
+                return;
+            end
+        end
+    end
+end
+
+function tf = localValueToBool(value, defaultValue)
+    tf = defaultValue;
+    try
+        if islogical(value)
+            tf = logical(value(1));
+        elseif isnumeric(value)
+            tf = value(1) ~= 0;
+        elseif ischar(value) || (isstring(value) && isscalar(value))
+            txt = lower(strtrim(char(string(value))));
+            if any(strcmp(txt, {'1','true','yes','on','oui'}))
+                tf = true;
+            elseif any(strcmp(txt, {'0','false','no','off','non'}))
+                tf = false;
+            end
+        end
+    catch
+        tf = defaultValue;
     end
 end
 
@@ -1055,8 +1226,12 @@ try
     if isstring(names), names = cellstr(names); end
     if ischar(names), names = {names}; end
 
-    prefixes = {['results_' outputName '_'], ['prob_' outputName '_']};
-    exactNames = {['results_' outputName], [outputName '_cellprob']};
+    prefixes = {['results_' outputName '_']};
+    exactNames = {['results_' outputName]};
+    if localClassiWantsProbabilityOutput(classiobj)
+        prefixes{end+1} = ['prob_' outputName '_']; %#ok<AGROW>
+        exactNames{end+1} = [outputName '_cellprob']; %#ok<AGROW>
+    end
 
     keep = false(1, numel(names));
     for iName = 1:numel(names)
@@ -1069,6 +1244,20 @@ try
     channels = names(keep);
 catch
     channels = {};
+end
+end
+
+function tf = localClassiWantsProbabilityOutput(classif)
+tf = false;
+try
+    if ~(isprop(classif,'outputType') && ~isempty(classif.outputType))
+        return;
+    end
+    outType = lower(strtrim(char(string(classif.outputType))));
+    outType = strrep(outType, 'probability', 'proba');
+    tf = any(strcmp(outType, {'proba','both'}));
+catch
+    tf = false;
 end
 end
 
@@ -1165,19 +1354,30 @@ function tf = shouldDeferSaveLocal(mode)
     tf = strcmp(normalizeSaveModeLocal(mode), 'defer');
 end
 
-function markDeferredDirtyLocal(roiobj, hasData, hasImage)
+function markDeferredDirtyLocal(roiobj, hasData, hasImage, saveChannels)
+    if nargin < 4
+        saveChannels = {};
+    end
     try
         if ~isstruct(roiobj.results)
             roiobj.results = struct();
         end
-        dirty = struct('data', false, 'image', false);
+        dirty = struct('data', false, 'image', false, 'fullImage', false, 'channels', {{}});
         if isfield(roiobj.results, 'pipelineDeferredDirty') && isstruct(roiobj.results.pipelineDeferredDirty)
             dirty = roiobj.results.pipelineDeferredDirty;
             if ~isfield(dirty,'data'), dirty.data = false; end
             if ~isfield(dirty,'image'), dirty.image = false; end
+            if ~isfield(dirty,'fullImage'), dirty.fullImage = false; end
+            if ~isfield(dirty,'channels'), dirty.channels = {}; end
         end
         dirty.data = logical(dirty.data || hasData);
         dirty.image = logical(dirty.image || hasImage);
+        if hasImage && isempty(saveChannels)
+            dirty.fullImage = true;
+            dirty.channels = {};
+        elseif hasImage && ~dirty.fullImage
+            dirty.channels = unique([cellstr(string(dirty.channels(:)))' cellstr(string(saveChannels(:)))'], 'stable');
+        end
         roiobj.results.pipelineDeferredDirty = dirty;
     catch
     end
@@ -1390,6 +1590,196 @@ end
 
 if isprop(classif,'classifyFun')
     fun = classif.classifyFun;
+end
+end
+
+function ensureRequiredChannelsLoadedLocal(roiobjLocal, ctx, fallbackChannels)
+channels = requiredChannelsFromContextLocal(ctx, fallbackChannels);
+if isempty(channels)
+    return;
+end
+channels = filterExistingChannelNamesLocal(roiobjLocal, channels);
+if isempty(channels)
+    return;
+end
+try
+    roiobjLocal.load('Channel', channels, 'Silent');
+catch ME
+    warning('classifyData:RequiredChannelLoadFailed', ...
+        'Could not preload required ROI channel(s) %s for ROI "%s": %s', ...
+        strjoin(channels, ', '), safeRoiIdLocal(roiobjLocal), ME.message);
+end
+end
+
+function loadRoiImageForClassificationLocal(roiobjLocal, ctx, fallbackChannels)
+requiredChannels = requiredChannelsFromContextLocal(ctx, fallbackChannels);
+requiredChannels = filterExistingChannelNamesLocal(roiobjLocal, requiredChannels);
+
+if isempty(requiredChannels)
+    roiobjLocal.load;
+    return;
+end
+
+try
+    roiobjLocal.load('Channel', requiredChannels, 'Silent');
+catch ME
+    warning('classifyData:RequiredChannelLoadFailed', ...
+        'Could not load required ROI channel(s) %s for ROI "%s": %s. Falling back to full ROI load.', ...
+        strjoin(requiredChannels, ', '), safeRoiIdLocal(roiobjLocal), ME.message);
+    roiobjLocal.load;
+end
+end
+
+function channels = requiredChannelsFromContextLocal(ctx, fallbackChannels)
+if nargin < 2
+    fallbackChannels = {};
+end
+channels = {};
+try
+    if isstruct(ctx) && isfield(ctx, 'io') && isstruct(ctx.io) && ...
+            isfield(ctx.io, 'requiredChannels') && ~isempty(ctx.io.requiredChannels)
+        channels = normalizeChannelListLocal(ctx.io.requiredChannels);
+    end
+catch
+    channels = {};
+end
+if isempty(channels)
+    channels = normalizeChannelListLocal(fallbackChannels);
+end
+end
+
+function channels = channelForRoiLocal(channelArg, idx)
+channels = {};
+try
+    if isempty(channelArg)
+        return;
+    end
+    if iscell(channelArg) && numel(channelArg) >= idx
+        channels = channelArg{idx};
+    else
+        channels = channelArg;
+    end
+catch
+    channels = {};
+end
+end
+
+function channels = normalizeChannelListLocal(value)
+channels = {};
+if isempty(value)
+    return;
+end
+if ischar(value)
+    s = strtrim(value);
+    if isempty(s) || startsWith(s, '<') || any(strcmpi(s, {'none','auto','n/a','<all>'}))
+        return;
+    end
+    channels = {s};
+    return;
+end
+if isstring(value)
+    vals = cellstr(value(:));
+    for i = 1:numel(vals)
+        s = strtrim(char(vals{i}));
+        if isempty(s) || startsWith(s, '<') || any(strcmpi(s, {'none','auto','n/a','<all>'}))
+            continue;
+        end
+        channels{end+1} = s; %#ok<AGROW>
+    end
+    channels = unique(channels(~cellfun(@isempty, channels)), 'stable');
+    return;
+end
+if iscell(value)
+    for i = 1:numel(value)
+        channels = [channels normalizeChannelListLocal(value{i})]; %#ok<AGROW>
+    end
+    channels = unique(channels(~cellfun(@isempty, channels)), 'stable');
+    return;
+end
+vals = cellstr(string(value(:)));
+for i = 1:numel(vals)
+    s = strtrim(char(string(vals{i})));
+    if isempty(s) || startsWith(s, '<') || any(strcmpi(s, {'none','auto','n/a','<all>'}))
+        continue;
+    end
+    channels{end+1} = s; %#ok<AGROW>
+end
+channels = unique(channels(~cellfun(@isempty, channels)), 'stable');
+end
+
+function channels = filterExistingChannelNamesLocal(roiobjLocal, channels)
+channels = normalizeChannelListLocal(channels);
+if isempty(channels)
+    return;
+end
+keep = true(size(channels));
+for i = 1:numel(channels)
+    try
+        keep(i) = ~isempty(roiobjLocal.findChannelID(channels{i}));
+    catch
+        keep(i) = false;
+    end
+end
+channels = channels(keep);
+end
+
+function channels = resolveClassificationChannelsLocal(roiobjLocal, classiobjLocal, channels)
+requested = normalizeChannelListLocal(channels);
+existing = filterExistingChannelNamesLocal(roiobjLocal, requested);
+if ~isempty(existing)
+    if numel(existing) == 1
+        channels = existing{1};
+    else
+        channels = existing;
+    end
+    return;
+end
+
+if ~isempty(requested)
+    warning('classifyData:InvalidInputChannel', ...
+        'Requested input channel(s) %s not found for ROI "%s"; using classifier input channel(s).', ...
+        strjoin(requested, ', '), safeRoiIdLocal(roiobjLocal));
+end
+
+try
+    fallback = classiobjLocal.getInputChannels();
+catch
+    fallback = classiobjLocal.channelName;
+end
+fallback = filterExistingChannelNamesLocal(roiobjLocal, fallback);
+if numel(fallback) == 1
+    channels = fallback{1};
+else
+    channels = fallback;
+end
+end
+
+function ensureChannelIndicesAddressableLocal(roiobjLocal, channels)
+if isempty(roiobjLocal.image)
+    return;
+end
+channelNames = normalizeChannelListLocal(channels);
+if isempty(channelNames)
+    return;
+end
+try
+    pix = [];
+    for i = 1:numel(channelNames)
+        pix = [pix roiobjLocal.findChannelID(channelNames{i})]; %#ok<AGROW>
+    end
+    pix = pix(~isnan(pix) & pix > 0);
+    if isempty(pix)
+        return;
+    end
+    if max(pix) > size(roiobjLocal.image, 3)
+        disp(['[DEBUG] classifyData: ROI ' safeRoiIdLocal(roiobjLocal) ...
+            ' has partially loaded channels but classifier needs global channel indices -> reloading full ROI']);
+        roiobjLocal.load('Silent');
+    end
+catch ME
+    warning('classifyData:ChannelAddressabilityCheckFailed', ...
+        'Could not verify loaded channel indices for ROI "%s": %s', ...
+        safeRoiIdLocal(roiobjLocal), ME.message);
 end
 end
 
