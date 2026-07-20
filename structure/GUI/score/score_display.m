@@ -75,6 +75,7 @@ end
  opts = score_collectDisplayOptions(arg{:});
  %cmap=app.MoviecolormapEditField.Value;
  opts=score_updateLayout(opts,selectedROI);
+ opts = localApplyLineageOverlayOptions(app, opts);
  syncChannelTableLevels(app, opts, selectedROI);
 
  %opts.paintChannel = app.DisplaySettings.Movie.paintChannel;  % peut être 0, un rang, ou un nom
@@ -142,8 +143,9 @@ restoreScoreFigureState(app, figureState);
    end
 
 score_syncOverlayAxes(app.graphicsHandles);
+score_refreshScaleBars(app.graphicsHandles, opts);
 try
-    app.ImageFigure.SizeChangedFcn = @(~, ~) score_syncOverlayAxes(app.graphicsHandles);
+    app.ImageFigure.SizeChangedFcn = @(~, ~) syncScoreOverlayAndScaleBars(app);
 catch
 end
 
@@ -184,8 +186,15 @@ app.ImageFigure.Name = ['ROI:' selectedROI.id ' -  Frame: ' num2str(selectedROI.
 
 % --- Overlay lineage (fille→mère)
 try
-    ensureCellInformationDataseries(selectedROI);  % sûr & idempotent
-    if isprop(app,'PaintButton') && app.PaintButton.Value && ~isempty(app.UIAnnotationTable.Selection)
+    shouldPrepareLineage = false;
+    if isprop(app, 'DisplayBudPairingCheckBox') && ~isempty(app.DisplayBudPairingCheckBox) && isvalid(app.DisplayBudPairingCheckBox)
+        shouldPrepareLineage = shouldPrepareLineage || logical(app.DisplayBudPairingCheckBox.Value);
+    end
+    if isprop(app, 'DisplayLineageCheckBox') && ~isempty(app.DisplayLineageCheckBox) && isvalid(app.DisplayLineageCheckBox)
+        shouldPrepareLineage = shouldPrepareLineage || logical(app.DisplayLineageCheckBox.Value);
+    end
+    if shouldPrepareLineage && isprop(app,'PaintButton') && app.PaintButton.Value && ~isempty(app.UIAnnotationTable.Selection)
+        ensureCellInformationDataseries(selectedROI);  % sûr & idempotent
         sel = app.UIAnnotationTable.Selection;
         ann = app.UIAnnotationTable.Data{sel(1),2};
         cls = app.UIAnnotationTable.Data{sel(1),3};
@@ -352,4 +361,39 @@ catch ME
 end
 end
 
+function syncScoreOverlayAndScaleBars(app)
+try
+    score_syncOverlayAxes(app.graphicsHandles);
+    if isprop(app, 'layoutOptions') && ~isempty(app.layoutOptions)
+        score_refreshScaleBars(app.graphicsHandles, app.layoutOptions);
+    end
+catch
+end
+end
 
+function opts = localApplyLineageOverlayOptions(app, opts)
+showBud = true;
+showGenealogy = false;
+try
+    if isprop(app, 'ShowBudPairingOverlay') && ~isempty(app.ShowBudPairingOverlay)
+        showBud = logical(app.ShowBudPairingOverlay);
+    end
+    if isprop(app, 'ShowLineageOverlay') && ~isempty(app.ShowLineageOverlay)
+        showGenealogy = logical(app.ShowLineageOverlay);
+    end
+    if isprop(app, 'DisplayBudPairingCheckBox') && ~isempty(app.DisplayBudPairingCheckBox) && isvalid(app.DisplayBudPairingCheckBox)
+        showBud = logical(app.DisplayBudPairingCheckBox.Value);
+    end
+    if isprop(app, 'DisplayLineageCheckBox') && ~isempty(app.DisplayLineageCheckBox) && isvalid(app.DisplayLineageCheckBox)
+        showGenealogy = logical(app.DisplayLineageCheckBox.Value);
+    end
+catch
+end
+opts.ShowBudPairingOverlay = showBud;
+opts.ShowLineageOverlay = showGenealogy;
+try
+    app.ShowBudPairingOverlay = showBud;
+    app.ShowLineageOverlay = showGenealogy;
+catch
+end
+end

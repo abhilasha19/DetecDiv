@@ -25,6 +25,7 @@ masterTL = displayHandles.masterTiledLayout;
 % Initialisation des containers pour stocker les handles
 graphicsHandles.imgHandles     = containers.Map('KeyType','double','ValueType','any');
 graphicsHandles.lineHandles    = containers.Map('KeyType','double','ValueType','any');
+graphicsHandles.dataAxes       = containers.Map('KeyType','double','ValueType','any');
 graphicsHandles.overlayHandles = containers.Map('KeyType','double','ValueType','any');
 graphicsHandles.vectorHandles = containers.Map('KeyType','double','ValueType','any');
 graphicsHandles.textHandles = containers.Map('KeyType','double','ValueType','any');
@@ -65,7 +66,7 @@ switch lower(displayHandles.mode)
                 if layoutOptions.overlay
                     % Combine les canaux pour chaque frame.
                     for frame = 1:numel(layoutOptions.frames)
-                        % curframe=layoutOptions.frames(frame);
+                        curframe=layoutOptions.frames(frame);
 
 
 
@@ -80,6 +81,7 @@ switch lower(displayHandles.mode)
                         ax = nexttile(masterTL, tileIndex, [layoutOptions.Nbrick, layoutOptions.Nbrick]);
 
                         hImg = imshow(displayImage, []);
+                        score_drawMovieEventText(ax, layoutOptions, curframe);
 
                         [htext, hvector]=score_displayVectorGraphics(ax, frame, 1, vContours , layoutOptions);
 
@@ -97,11 +99,10 @@ switch lower(displayHandles.mode)
                 else
                     % Chaque canal séparé : layout classique.
                     for frame = 1:numel(layoutOptions.frames)
+                        [displayImage, vContours]=score_makeComposite(roiData,frame,layoutOptions);
                         for ch = 1:layoutOptions.Nchannel
 
                             curframe=layoutOptions.frames(frame);
-
-                            [displayImage, vContours]=score_makeComposite(roiData,frame,layoutOptions);
 
                             local_row = (ch-1)*layoutOptions.Nbrick + 1;
                             local_col = (frame-1)*layoutOptions.Nbrick + 1;
@@ -112,6 +113,9 @@ switch lower(displayHandles.mode)
 
                             %  img = roiData.image(:,:,ch,frame);
                             hImg = imshow(displayImage(:,:,:,ch), []);
+                            if ch == 1
+                                score_drawMovieEventText(ax, layoutOptions, curframe);
+                            end
                             [htext, hvector]=score_displayVectorGraphics(ax, frame, ch, vContours , layoutOptions);
                             if frame == numel(layoutOptions.frames)
                                 hScale = score_drawChannelScaleBar(ax, layoutOptions, ch);
@@ -151,6 +155,7 @@ switch lower(displayHandles.mode)
 
                         % title(sprintf('ROI(%d) Data:%d', roiIndex, ds));
                         graphicsHandles.lineHandles(tileIndex) = hLine;
+                        graphicsHandles.dataAxes(tileIndex) = ax;
                     end
                 end
                 if layoutOptions.debug
@@ -228,6 +233,7 @@ newPath = fullfile(folder, [name '.pdf']);
                 %  hLine = plot(roiData.data(ds, :));
                 %   title(sprintf('Data:%d', ds));
                 graphicsHandles.lineHandles(tileIndex) = hLine;
+                graphicsHandles.dataAxes(tileIndex) = ax;
             end
         end
 
@@ -260,6 +266,10 @@ newPath = fullfile(folder, [name '.pdf']);
             %             axImg.UserData.OverlayHandle = hOverlay;
             %  axOverlay.UserData.CDataHandle=
             graphicsHandles.overlayHandles(tileIndex) = hOverlay;
+            hScale = localDrawChannelScaleBars(axOverlay, layoutOptions);
+            if ~isempty(hScale)
+                graphicsHandles.scaleBarHandles(tileIndex) = hScale;
+            end
             axarray=[axarray axOverlay];
         else
             % Si overlay false, chaque canal est affiché.
@@ -367,6 +377,11 @@ if strlength(titleStr) > 0
 end
 score_drawMovieEventText(ax, layoutOptions, layoutOptions.frames(1));
 
+hScale = localDrawChannelScaleBars(ax, layoutOptions);
+if ~isempty(hScale)
+    graphicsHandles.scaleBarHandles(tileIndex) = hScale;
+end
+
 
 
 
@@ -380,6 +395,7 @@ score_drawMovieEventText(ax, layoutOptions, layoutOptions.frames(1));
                     graphicsHandles.imgHandles(tileIndex) = hImg;
                 else
                     % Affichage de chaque canal séparément.
+                    [displayImage, vContours]=score_makeComposite(roiData,1,layoutOptions);
                     for ch = 1:layoutOptions.Nchannel
                         local_row = 1;
                         local_col = (ch-1)*layoutOptions.Nbrick + 1;
@@ -387,7 +403,6 @@ score_drawMovieEventText(ax, layoutOptions, layoutOptions.frames(1));
                         global_col = ROI_col_offset + local_col;
                         tileIndex = (global_row-1)*displayHandles.MasterCols + global_col;
                         ax = nexttile(masterTL, tileIndex, [layoutOptions.Nbrick, layoutOptions.Nbrick]);
-                        [displayImage, vContours]=score_makeComposite(roiData,1,layoutOptions);
                         %  img = roiData.image(:,:,ch,1);
                         hImg = imshow(displayImage(:,:,:,ch), []);
                         hScale = score_drawChannelScaleBar(ax, layoutOptions, ch);
@@ -456,6 +471,7 @@ end
                         %  hLine = plot(roiData.data(ds, :));
                         %   title(sprintf('Data:%d', ds));
                         graphicsHandles.lineHandles(tileIndex) = hLine;
+                        graphicsHandles.dataAxes(tileIndex) = ax;
 
                         %   hLine = plot(roiData.data(ds, :));
                         %   title(sprintf('Data:%d', ds));
@@ -619,6 +635,27 @@ yCenter = mean(ylim_);
 wid=2*nbrick*scalingFactor;
 line(ax, [xRight xRight], ylim_, ...
     'Color', background, 'LineWidth', wid, 'LineStyle', '-');
+end
+
+function hScale = localDrawChannelScaleBars(ax, layoutOptions)
+hScale = gobjects(0);
+if isempty(ax) || ~isgraphics(ax) || isempty(layoutOptions) || ...
+        ~isfield(layoutOptions, 'scale') || isempty(layoutOptions.scale)
+    return;
+end
+
+nCh = numel(layoutOptions.scale);
+if isfield(layoutOptions, 'Nchannel') && ~isempty(layoutOptions.Nchannel)
+    nCh = min(nCh, layoutOptions.Nchannel);
+end
+scaledChannels = find(logical(layoutOptions.scale(1:nCh)));
+offsetCount = numel(scaledChannels);
+for i = 1:offsetCount
+    h = score_drawChannelScaleBar(ax, layoutOptions, scaledChannels(i), i, offsetCount);
+    if ~isempty(h)
+        hScale = [hScale h]; %#ok<AGROW>
+    end
+end
 end
 
 function localAddMovieImageDataGap(ax, layoutOptions, dataPanelIndex)

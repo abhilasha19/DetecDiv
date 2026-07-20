@@ -29,6 +29,8 @@ output.datatype='';
 progress=[];
 cancelTokenFile='';
 typ=[];
+phyloCellIncludeContours = true;
+phyloCellPositionIdx = [];
 
 % check if string represents a valid file or folder
 inputIsFile = false;
@@ -63,6 +65,12 @@ for i=1:numel(varargin)
     end
     if strcmpi(varargin{i}, 'canceltokenfile') || strcmpi(varargin{i}, 'cancel_token_file')
         cancelTokenFile=char(string(varargin{i+1}));
+    end
+    if strcmpi(varargin{i}, 'phylocellcontours') || strcmpi(varargin{i}, 'phylocellincludecontours')
+        phyloCellIncludeContours=logical(varargin{i+1});
+    end
+    if strcmpi(varargin{i}, 'phylocellpositionidx') || strcmpi(varargin{i}, 'positionidx') || strcmpi(varargin{i}, 'positionindex')
+        phyloCellPositionIdx=varargin{i+1};
     end
 end
 progress = attachCancelTokenToProgress(progress, cancelTokenFile);
@@ -123,7 +131,7 @@ else
     end
     list=dir(pathdir);
 end
-list = list(~startsWith({list.name}, '._')); % remove ._ files in mac os .
+list = list(~localIsIgnoredFilesystemArtifact({list.name})); % remove macOS and hidden filesystem artifacts
 
 % --- detect NDTiff dataset(s) ---
 ndtiffDirs = {};
@@ -286,7 +294,7 @@ switch typ
         detecdiv_check_cancel(progress, 'raw parser phylocell');
         
         output.comments=['The folder contains a phylocell project' char(10)];
-        output= buildphylocell(phyloproj,output,progress);
+        output= buildphylocell(phyloproj,output,progress,phyloCellIncludeContours,phyloCellPositionIdx);
         
     case 'folders' % process each folder as independent positions (incldues micromanager)
         detecdiv_check_cancel(progress, 'raw parser folders');
@@ -340,6 +348,14 @@ end
 function tf = localHasZarrRootMetadata(pathstr)
 tf = exist(fullfile(pathstr,'zarr.json'), 'file') == 2 || ...
     (exist(fullfile(pathstr,'.zattrs'), 'file') == 2 && exist(fullfile(pathstr,'.zgroup'), 'file') == 2);
+end
+
+function tf = localIsIgnoredFilesystemArtifact(names)
+names = cellstr(string(names));
+tf = startsWith(names, '._') | ...
+    strcmp(names, '.AppleDouble') | ...
+    strcmp(names, '.DS_Store') | ...
+    strcmp(names, '__MACOSX');
 end
 
 

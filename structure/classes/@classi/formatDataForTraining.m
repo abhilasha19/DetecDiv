@@ -107,7 +107,40 @@ if numel(rois) == 0
         rois = classif.trainingset;
     end
 end
-valrois = setxor(1:numel(classif.roi), rois);
+rois = normalizeRoiListLocal(rois, numel(classif.roi));
+testrois = [];
+valrois = [];
+hasExplicitVal = false;
+try
+    if isprop(classif, 'dataset') && isstruct(classif.dataset) && ...
+            isfield(classif.dataset, 'split') && isstruct(classif.dataset.split)
+        if isfield(classif.dataset.split, 'test')
+            testrois = normalizeRoiListLocal(classif.dataset.split.test, numel(classif.roi));
+        end
+        if isfield(classif.dataset.split, 'val') && ~isempty(classif.dataset.split.val)
+            valrois = normalizeRoiListLocal(classif.dataset.split.val, numel(classif.roi));
+            hasExplicitVal = true;
+        end
+    end
+catch
+    testrois = [];
+    valrois = [];
+    hasExplicitVal = false;
+end
+if ~hasExplicitVal
+    valrois = setdiff(1:numel(classif.roi), rois, 'stable');
+end
+if ~isempty(testrois)
+    beforeTrain = rois;
+    beforeVal = valrois;
+    rois = setdiff(rois, testrois, 'stable');
+    valrois = setdiff(valrois, testrois, 'stable');
+    if numel(beforeTrain) ~= numel(rois) || numel(beforeVal) ~= numel(valrois)
+        warning('classi:TestRoisExcludedFromTrainingExport', ...
+            'FormatDataForTraining excluded test ROI(s) from training/validation export: %s', ...
+            strjoin(cellstr(string(testrois)), ', '));
+    end
+end
 
 
 
@@ -178,7 +211,7 @@ switch category
     case {'Image', 'Image Regression'}
         % (pour l'instant je ne forwarde pas extraArgs aux formats Image,
         %  mais on peut le faire si tu veux y brancher le crop, etc.)
-        output = formatImageTrainingSet(foldername, classif, rois);
+        output = formatImageTrainingSet(foldername, classif, rois, 'Frames', Frames);
 
     case 'LSTM'
 
@@ -188,25 +221,25 @@ switch category
         if isprop(classif, 'description')
             if (iscell(classif.description{1}) && strcmp(classif.description{1}{1}, 'YOLO instance segmentation')) || ...
                     (ischar(classif.description{1}) && strcmp(classif.description{1},     'YOLO instance segmentation'))
-                output = formatPixelTrainingSetYOLO(foldername, classif, rois, valrois);
+                output = formatPixelTrainingSetYOLO(foldername, classif, rois, valrois, 'Frames', Frames);
 
             elseif (iscell(classif.description{1}) && strcmp(classif.description{1}{1}, 'CellposeSAM')) || ...
                     (ischar(classif.description{1}) && strcmp(classif.description{1},     'CellposeSAM'))
-                output = formatPixelTrainingSetCPSAM(foldername, classif, rois, valrois);
+                output = formatPixelTrainingSetCPSAM(foldername, classif, rois, valrois, 'Frames', Frames);
 
             elseif (iscell(classif.description{1}) && strcmp(classif.description{1}{1}, 'Cell-TRACKTR')) || ...
                     (ischar(classif.description{1}) && strcmp(classif.description{1},     'Cell-TRACKTR'))
-                output = formatPixelTrainingSetCellTracktr(foldername, classif, rois, valrois);
+                output = formatPixelTrainingSetCellTracktr(foldername, classif, rois, valrois, 'Frames', Frames);
 
             else
-                output = formatPixelTrainingSet(foldername, classif, rois);
+                output = formatPixelTrainingSet(foldername, classif, rois, 'Frames', Frames);
             end
         else
-            output = formatPixelTrainingSet(foldername, classif, rois);
+            output = formatPixelTrainingSet(foldername, classif, rois, 'Frames', Frames);
         end
 
     case 'Object'
-        output = formatObjectTrainingSet(foldername, classif, rois);
+        output = formatObjectTrainingSet(foldername, classif, rois, 'Frames', Frames);
 
     case 'Pedigree'
         output = formatDeltaPedigreeTrainingSet(foldername, classif, rois);
@@ -239,5 +272,14 @@ end
         if ~isempty(dot)
             pkg = f(1:dot(1)-1);
         end
+    end
+
+    function roisOut = normalizeRoiListLocal(roisIn, nRois)
+        if isempty(roisIn)
+            roisOut = [];
+            return;
+        end
+        roisOut = unique(round(double(roisIn(:)')), 'stable');
+        roisOut = roisOut(isfinite(roisOut) & roisOut >= 1 & roisOut <= nRois);
     end
 end

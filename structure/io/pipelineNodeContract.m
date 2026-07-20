@@ -87,6 +87,10 @@ function contract = defaultContractForNode(node)
             binding.resolveAt = 'run';
             binding.transfer = 'sourceInventory';
             resources.out = resourceDef('channel', 'source', 'channels', 'channelFilter', 'channels', 'channelFilter', false, 'sourceInventory');
+            if strcmp(p, 'phylocellloader') || contains(f, 'phylocellloader')
+                out(end+1) = portDef('annotations', 'annotationSet', false, 'edge');
+                resources.out(end+1) = resourceDef('annotation', 'phyloCell_segmentation', 'phyloCell_segmentation', 'segmentationFile', 'annotations', 'segmentationFile', false, 'sourceInventory');
+            end
             summary = 'Loads positions/FOVs and exposes source image channels.';
 
         case {'roiidentify','roipattern'}
@@ -265,6 +269,32 @@ function contract = defaultContractForNode(node)
                     resourceDef('dataSeries', 'oscillation_metadata', 'osc_cycle_metadata', 'cycleMetadataOutputName', 'dataSeries', 'cycleMetadataOutputName', false, 'roiDataSeries') ...
                     ];
                 summary = 'Detrends computeMetrics fluorescence traces and extracts cell-cycle oscillation summaries from classification labels.';
+            elseif strcmp(p, 'phylocellannotations') || contains(f, 'phylocellannotations')
+                in(end+1) = portDef('annotations', 'annotationSet', true, 'edge');
+                selectors.framesParam = 'frames';
+                selectors.outputNameParam = 'outputName';
+                parameters.run = {'frames','outputName'};
+                parameters.static = {'cellChannelName','nucleusChannelName','createCellMasks','createNucleusMasks','createLineage'};
+                requirements.roi.required = true;
+                requirements.roi.channelsMin = 0;
+                requirements.params.optional = [{'pkg','outputName'}, parameters.static];
+                capabilities.preservesRoiList = true;
+                capabilities.roiChannels = true;
+                capabilities.roiDataSeries = true;
+                capabilities.outputsChannels = true;
+                capabilities.outputsDataSeries = true;
+                binding.scope = 'roi';
+                binding.outputScope = 'roi';
+                binding.mode = 'annotationImport';
+                binding.selectorKeys = {};
+                binding.resolveAt = 'run';
+                resources.in = resourceDef('annotation', 'phyloCell_segmentation', 'phyloCell_segmentation', '', 'annotations', '', true, '');
+                resources.out = [ ...
+                    resourceDef('channel', 'cell_mask', 'phyloCell_cells', 'cellChannelName', 'channels', 'cellChannelName', false, 'roiMasks'), ...
+                    resourceDef('channel', 'nucleus_mask', 'phyloCell_nuclei', 'nucleusChannelName', 'channels', 'nucleusChannelName', false, 'roiMasks'), ...
+                    resourceDef('dataSeries', 'lineage', 'phyloCell_lineage', 'outputName', 'dataSeries', 'outputName', false, 'roiDataSeries') ...
+                    ];
+                summary = 'Converts legacy phyloCell contour and lineage annotations into DetecDiv ROI mask channels and lineage dataseries.';
             else
             selectors.channelsParam = 'channels';
             selectors.channelParam = 'channel';
@@ -1708,10 +1738,17 @@ function keys = sam31ExecutionStaticKeys()
         spec = sam31.executionSpec();
         keys = spec.staticKeys;
     catch
-        keys = {'resolution','maxNumObjects','videoScoreThreshold', ...
-            'videoNewDetThreshold','videoAssocIouThreshold','sam31Runner', ...
+        keys = {'resolution','maxNumObjects','chunkSize','chunkOverlap','videoScoreThreshold', ...
+            'videoNewDetThreshold','videoAssocIouThreshold','hotstartUnmatchThreshold','sam31Runner', ...
             'inferBudPairing','budPairingSourceKey','budPairingShowSource', ...
-            'budPairingActivateSource','budPairingWriteCanonical','budPairingOverwriteMotherOf'};
+            'budPairingActivateSource','budPairingWriteCanonical','budPairingOverwriteMotherOf', ...
+            'budPairingTypicalCellSize','budPairingMaxBirthAreaFraction', ...
+            'budPairingMinParentAreaReferenceFraction', ...
+            'budPairingMaxParentDistanceFraction', ...
+            'budPairingMaxParentCentroidDistanceFraction', ...
+            'budPairingFutureWindow','budPairingMinParentAgeFrames', ...
+            'budPairingMaxFutureDistanceReferenceFraction', ...
+            'budPairingMaxFutureCentroidDistanceReferenceFraction'};
     end
 end
 

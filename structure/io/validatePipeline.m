@@ -144,6 +144,14 @@ function [ok, report] = validatePipeline(pipe, ctx, opts)
             if ~isempty(pathWarnings)
                 report.warnings = [report.warnings, pathWarnings]; %#ok<AGROW>
             end
+            [phyloErrors, phyloWarnings] = phyloCellAnnotationIssues(node, ctx, nodes, edges);
+            if ~isempty(phyloErrors)
+                ok = false;
+                report.errors = [report.errors, phyloErrors]; %#ok<AGROW>
+            end
+            if ~isempty(phyloWarnings)
+                report.warnings = [report.warnings, phyloWarnings]; %#ok<AGROW>
+            end
             designErrors = requiredDesignAssetErrors(node, ctx);
             if ~isempty(designErrors)
                 if hasNodeGui(node) && allowGui
@@ -2014,6 +2022,238 @@ for i = 1:numel(outputKeys)
 end
 end
 
+function [errors, warnings] = phyloCellAnnotationIssues(node, ctx, nodes, edges)
+errors = {};
+warnings = {};
+
+if nargin < 3
+    nodes = struct([]);
+end
+if nargin < 4
+    edges = struct([]);
+end
+
+if ~isNodeEnabledForValidation(node)
+    return;
+end
+
+nodeType = lower(char(string(getField(node, 'type', ''))));
+pkgName = lower(char(string(getField(node, 'pkg', ''))));
+funcName = lower(char(string(getField(node, 'func', ''))));
+p = getField(node, 'params', struct());
+if isempty(pkgName) && isstruct(p) && isfield(p, 'pkg') && ~isempty(p.pkg)
+    pkgName = lower(char(string(p.pkg)));
+end
+if ~strcmp(nodeType, 'processor') || ~(strcmp(pkgName, 'phylocellannotations') || contains(funcName, 'phylocellannotations'))
+    return;
+end
+
+nodeId = char(string(getField(node, 'id', '')));
+if isstruct(p) && isfield(p, 'segmentationFile') && ~isempty(p.segmentationFile)
+    segFile = char(string(p.segmentationFile));
+    if isPhyloSegmentationBindingToken(segFile)
+        % Legacy templates may contain a symbolic resource binding here
+        % (for example "load_phylocell"). The real annotation file is
+        % stored on each FOV by the phyloCell loader, so continue below.
+    elseif exist(segFile, 'file') ~= 2
+        errors{end+1} = sprintf('Node %s requires phyloCell segmentation file "%s", but the file does not exist.', nodeId, segFile);
+        return;
+    else
+        return;
+    end
+end
+
+[hasLoader, loaderReusesProject] = hasUpstreamPhyloCellAnnotationLoader(node, nodes, edges, ctx);
+if hasLoader && ~loaderReusesProject
+    return;
+end
+
+shallowObj = [];
+if isfield(ctx, 'shallow') && isa(ctx.shallow, 'shallow')
+    shallowObj = ctx.shallow;
+elseif isfield(ctx, 'shallowObj') && isa(ctx.shallowObj, 'shallow')
+    shallowObj = ctx.shallowObj;
+end
+if isempty(shallowObj)
+    return;
+end
+
+fovIndex = selectedFovIndicesForPhyloValidation(ctx, shallowObj);
+missing = [];
+missingFiles = {};
+for ii = reshape(fovIndex, 1, [])
+    segFile = phyloSegmentationFileForFov(shallowObj.fov(ii));
+    if isempty(segFile)
+        missing(end+1) = ii; %#ok<AGROW>
+    elseif exist(segFile, 'file') ~= 2
+        missingFiles{end+1} = sprintf('FOV %d: %s', ii, segFile); %#ok<AGROW>
+    end
+end
+
+if ~isempty(missing)
+    if hasLoader && loaderReusesProject
+        errors{end+1} = sprintf(['Node %s requires phyloCell segmentation annotations, but load_phylocell ' ...
+            'is configured to reuse existing project image sources and will not parse the phyloCell raw project. ' ...
+            'No fov.contours.phyloCell.segmentationFile is available for FOV(s): %s. Switch Input mode to ' ...
+            '"Parse raw images into project" to import annotation links, or disable convert_phylocell_annotations.'], ...
+            nodeId, mat2str(missing));
+    else
+        errors{end+1} = sprintf(['Node %s requires phyloCell segmentation annotations, but no ' ...
+            'fov.contours.phyloCell.segmentationFile is available for FOV(s): %s. ' ...
+            'Enable load_phylocell to import annotation links, or disable convert_phylocell_annotations ' ...
+            'when only redefining/extracting raw ROIs.'], nodeId, mat2str(missing));
+    end
+end
+if ~isempty(missingFiles)
+    errors{end+1} = sprintf(['Node %s requires phyloCell segmentation annotations, but these linked ' ...
+        'segmentation file(s) are missing on disk: %s.'], nodeId, strjoin(missingFiles, ' | '));
+end
+end
+
+function tf = isNodeEnabledForValidation(node)
+tf = true;
+try
+    if isfield(node, 'enabled') && ~isempty(node.enabled)
+        tf = logical(node.enabled);
+    end
+catch
+    tf = true;
+end
+end
+
+function fovIndex = selectedFovIndicesForPhyloValidation(ctx, shallowObj)
+fovIndex = [];
+keys = {'fovIndex', 'fovList'};
+for kk = 1:numel(keys)
+    key = keys{kk};
+    if isfield(ctx, key) && ~isempty(ctx.(key)) && isnumeric(ctx.(key))
+        fovIndex = double(ctx.(key));
+        break;
+    end
+end
+try
+    if isempty(fovIndex) && isfield(ctx, 'run') && isstruct(ctx.run)
+        runKeys = {'fovIndex', 'fovs', 'sourceFovIndex'};
+        for kk = 1:numel(runKeys)
+            key = runKeys{kk};
+            if isfield(ctx.run, key) && ~isempty(ctx.run.(key)) && isnumeric(ctx.run.(key))
+                fovIndex = double(ctx.run.(key));
+                break;
+            end
+        end
+    end
+catch
+end
+try
+    nFov = numel(shallowObj.fov);
+catch
+    nFov = 0;
+end
+if isempty(fovIndex)
+    fovIndex = 1:nFov;
+end
+fovIndex = unique(round(double(fovIndex(:)')));
+fovIndex = fovIndex(isfinite(fovIndex) & fovIndex >= 1 & fovIndex <= nFov);
+end
+
+function segFile = phyloSegmentationFileForFov(fovObj)
+segFile = '';
+try
+    if isprop(fovObj, 'contours') && isstruct(fovObj.contours) && ...
+            isfield(fovObj.contours, 'phyloCell') && isstruct(fovObj.contours.phyloCell) && ...
+            isfield(fovObj.contours.phyloCell, 'segmentationFile') && ~isempty(fovObj.contours.phyloCell.segmentationFile)
+        segFile = char(string(fovObj.contours.phyloCell.segmentationFile));
+    end
+catch
+    segFile = '';
+end
+end
+
+function [hasLoader, reusesProjectSources] = hasUpstreamPhyloCellAnnotationLoader(node, nodes, edges, ctx)
+hasLoader = false;
+reusesProjectSources = false;
+targetId = char(string(getField(node, 'id', '')));
+if isempty(targetId) || isempty(nodes) || isempty(edges)
+    return;
+end
+
+for i = 1:numel(edges)
+    if ~strcmp(char(string(getField(edges(i), 'to', ''))), targetId)
+        continue;
+    end
+    fromPort = lower(char(string(getField(edges(i), 'fromPort', ''))));
+    toPort = lower(char(string(getField(edges(i), 'toPort', ''))));
+    if ~isempty(fromPort) && ~contains(fromPort, 'annotation') && ...
+            ~isempty(toPort) && ~contains(toPort, 'annotation')
+        continue;
+    end
+    sourceId = char(string(getField(edges(i), 'from', '')));
+    sourceNode = findNodeByIdLocal(nodes, sourceId);
+    if isempty(sourceNode)
+        continue;
+    end
+    if isPhyloCellLoaderNode(sourceNode) && isNodeEnabledForValidation(sourceNode)
+        hasLoader = true;
+        reusesProjectSources = phyloCellLoaderReusesProjectSources(sourceNode, ctx);
+        return;
+    end
+end
+end
+
+function tf = isPhyloCellLoaderNode(node)
+nodeType = lower(char(string(getField(node, 'type', ''))));
+pkgName = lower(char(string(getField(node, 'pkg', ''))));
+funcName = lower(char(string(getField(node, 'func', ''))));
+tf = strcmp(nodeType, 'dataloader') && ...
+    (strcmp(pkgName, 'phylocellloader') || contains(funcName, 'phylocellloader'));
+end
+
+function tf = phyloCellLoaderReusesProjectSources(node, ctx)
+tf = false;
+try
+    if isfield(ctx, 'dataLoader') && isstruct(ctx.dataLoader) && ...
+            isfield(ctx.dataLoader, 'useExistingProjectSources') && ~isempty(ctx.dataLoader.useExistingProjectSources)
+        tf = logical(ctx.dataLoader.useExistingProjectSources);
+        return;
+    end
+catch
+end
+try
+    if isfield(ctx, 'run') && isstruct(ctx.run) && ...
+            isfield(ctx.run, 'useExistingProjectSources') && ~isempty(ctx.run.useExistingProjectSources)
+        tf = logical(ctx.run.useExistingProjectSources);
+        return;
+    end
+catch
+end
+params = getField(node, 'params', struct());
+if isstruct(params) && isfield(params, 'useExistingProjectSources') && ~isempty(params.useExistingProjectSources)
+    tf = logical(params.useExistingProjectSources);
+end
+end
+
+function tf = isPhyloSegmentationBindingToken(value)
+txt = strtrim(char(string(value)));
+if isempty(txt)
+    tf = false;
+    return;
+end
+if startsWith(txt, '<') && endsWith(txt, '>')
+    tf = true;
+    return;
+end
+if startsWith(txt, '@')
+    tf = true;
+    return;
+end
+if looksLikeWindowsAbsPathLocal(txt) || startsWith(strrep(txt, '\', '/'), '/') || ...
+        contains(txt, '/') || contains(txt, '\') || endsWith(lower(txt), '.mat')
+    tf = false;
+    return;
+end
+tf = ~isempty(regexp(txt, '^[A-Za-z_]\w*$', 'once'));
+end
+
 function [errors, warnings, report] = pluginPackageIssues(node, ctx)
 errors = {};
 warnings = {};
@@ -3359,7 +3599,39 @@ function resources = initialResourceInventory(ctx, sem)
         resources(end+1) = resourceInventoryDef('mask', 'segmentation', masks{i}, masks{i}, 'ctx', 'masks', 'context'); %#ok<AGROW>
     end
 
+    phyloSegFiles = phyloSegmentationFilesFromContext(ctx);
+    for i = 1:numel(phyloSegFiles)
+        resources(end+1) = resourceInventoryDef('annotation', 'phyloCell_segmentation', 'phyloCell_segmentation', phyloSegFiles{i}, 'ctx', 'annotations', 'context'); %#ok<AGROW>
+    end
+
     resources = mergeResourceInventory(resourceInventoryDef(), resources);
+end
+
+function files = phyloSegmentationFilesFromContext(ctx)
+files = {};
+shallowObj = [];
+try
+    if isfield(ctx, 'shallow') && isa(ctx.shallow, 'shallow')
+        shallowObj = ctx.shallow;
+    elseif isfield(ctx, 'shallowObj') && isa(ctx.shallowObj, 'shallow')
+        shallowObj = ctx.shallowObj;
+    end
+catch
+    shallowObj = [];
+end
+if isempty(shallowObj)
+    return;
+end
+try
+    for ii = 1:numel(shallowObj.fov)
+        segFile = phyloSegmentationFileForFov(shallowObj.fov(ii));
+        if ~isempty(segFile) && exist(segFile, 'file') == 2
+            files{end+1} = segFile; %#ok<AGROW>
+        end
+    end
+catch
+end
+files = unique(files, 'stable');
 end
 
 function out = resourceSpecDef()
@@ -4225,6 +4497,10 @@ function available = initialAvailablePorts(ctx)
     end
     if any(strcmp(available, 'roiChannels')) && ~any(strcmp(available, 'channels'))
         available{end+1} = 'channels'; %#ok<AGROW>
+    end
+    if ((any(strcmp(available, 'fovList')) || any(strcmp(available, 'shallow')) || any(strcmp(available, 'shallowObj'))) && ...
+            ~any(strcmp(available, 'images')))
+        available{end+1} = 'images'; %#ok<AGROW>
     end
     if validationStartsFromExistingProject(ctx) && ~any(strcmp(available, 'roiList'))
         available{end+1} = 'roiList'; %#ok<AGROW>

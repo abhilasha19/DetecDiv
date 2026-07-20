@@ -1063,7 +1063,12 @@ function ctx = executeNode(node, ctx)
     switch nodeType
         case 'dataloader'
             try
-                ctx = dataLoader.process(ctx);
+                fun = resolveNodeFunc(node);
+                if strcmpi(char(string(fun)), 'dataLoader.process')
+                    ctx = dataLoader.process(ctx);
+                else
+                    ctx = feval(fun, ctx);
+                end
                 ctx = markDataloaderFovSelectionApplied(ctx);
             catch ME
                 throwNodeFailed(node, ME);
@@ -1181,6 +1186,10 @@ function tf = shouldUseRoiMajorExecution(report, nodeMap, ctx)
             tf = false;
             return;
         end
+        if hasClassifierTrainingIntent(report, nodeMap, ctx)
+            tf = false;
+            return;
+        end
         activeTypes = {};
         for i = 1:numel(ids)
             node = nodeMap(ids{i});
@@ -1197,6 +1206,36 @@ function tf = shouldUseRoiMajorExecution(report, nodeMap, ctx)
             return;
         end
         tf = all(ismember(activeTypes, {'classifier','processor'}));
+    catch
+        tf = false;
+    end
+end
+
+function tf = hasClassifierTrainingIntent(report, nodeMap, ctx)
+    tf = false;
+    try
+        ids = report.order;
+        if isempty(ids)
+            return;
+        end
+        for i = 1:numel(ids)
+            nodeId = ids{i};
+            if ~isKey(nodeMap, nodeId) || shouldSkipByRunSelection(ctx, nodeId)
+                continue;
+            end
+            node = applyRunNodeOverride(nodeMap(nodeId), ctx, nodeId);
+            if isfield(node,'enabled') && ~isempty(node.enabled) && ~logical(node.enabled)
+                continue;
+            end
+            if ~strcmpi(char(string(getfielddefault(node,'type',''))), 'classifier')
+                continue;
+            end
+            p = getRuntimeNodeParams(ctx, node, 'classifier');
+            if strcmp(classifierRunIntent(ctx, p), 'train')
+                tf = true;
+                return;
+            end
+        end
     catch
         tf = false;
     end
@@ -2168,6 +2207,11 @@ function ctx = executeProcessorNode(node, ctx)
     procCtx.run = getfielddefault(ctx, 'run', struct());
     procCtx.sel = getfielddefault(ctx, 'sel', struct());
     procCtx.pipeline = getfielddefault(ctx, 'pipeline', struct());
+    procCtx.shallow = getfielddefault(ctx, 'shallow', []);
+    procCtx.shallowObj = getfielddefault(ctx, 'shallowObj', procCtx.shallow);
+    procCtx.fovList = getfielddefault(ctx, 'fovList', []);
+    procCtx.roiList = rois;
+    procCtx.annotations = getfielddefault(ctx, 'annotations', struct());
     procCtx.io = getfielddefault(ctx, 'io', struct());
     procCtx.io.requiredChannels = requiredInputChannelsForNode(node, p);
     procCtx.store = getfielddefault(ctx, 'store', struct());

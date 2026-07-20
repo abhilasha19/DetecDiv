@@ -1215,18 +1215,43 @@ classdef pipeline2 < matlab.apps.AppBase
                 'roiTracked', 'roiTracked', '', 'Tracked/mobile ROI definition'; ...
                 'roiExtract', 'roiExtract', '', 'Extract ROI H5 image stores' ...
                 };
+            seen = {};
             for i = 1:size(preferred, 1)
                 pkgDir = fullfile(dlDir, ['+' preferred{i,1}]);
                 if isfolder(pkgDir)
                     rows(end+1,:) = preferred(i,:); %#ok<AGROW>
+                    seen{end+1} = preferred{i,1}; %#ok<AGROW>
                 end
             end
-            if isempty(rows) && isfolder(dlDir)
+            if isfolder(dlDir)
                 dirs = packageDirs(app, dlDir);
                 for i = 1:numel(dirs)
                     name = dirs{i};
-                    rows(end+1,:) = {name, name, '', ['Dataloading module: ' name]}; %#ok<AGROW>
+                    if any(strcmpi(seen, name))
+                        continue;
+                    end
+                    nodeType = dataloadingNodeTypeForPackage(app, name);
+                    rows(end+1,:) = {name, nodeType, name, moduleDescription(app, nodeType, name)}; %#ok<AGROW>
                 end
+            end
+        end
+
+        function nodeType = dataloadingNodeTypeForPackage(app, pkg) %#ok<INUSD>
+            switch lower(char(string(pkg)))
+                case {'dataloader','phylocellloader'}
+                    nodeType = 'dataLoader';
+                case {'roipattern','roiidentify'}
+                    nodeType = 'roiPattern';
+                case 'roimanual'
+                    nodeType = 'roiManual';
+                case 'roigrid'
+                    nodeType = 'roiGrid';
+                case 'roitracked'
+                    nodeType = 'roiTracked';
+                case 'roiextract'
+                    nodeType = 'roiExtract';
+                otherwise
+                    nodeType = char(string(pkg));
             end
         end
 
@@ -1369,6 +1394,29 @@ classdef pipeline2 < matlab.apps.AppBase
             tf = strcmpi(char(string(mode)), 'classifier_rois');
         end
 
+        function tf = runtimeProjectPathUsable(app, projectPath, allowCreate) %#ok<INUSD>
+            projectPath = strtrim(char(string(projectPath)));
+            tf = false;
+            if isempty(projectPath)
+                return;
+            end
+            if exist(projectPath, 'dir') == 7 || exist(projectPath, 'file') == 2
+                tf = true;
+                return;
+            end
+            if nargin < 3 || ~allowCreate
+                return;
+            end
+            [parentFolder, ~, ext] = fileparts(projectPath);
+            if strcmpi(ext, '.mat')
+                targetFolder = parentFolder;
+                parentFolder = fileparts(targetFolder);
+            else
+                targetFolder = projectPath; %#ok<NASGU>
+            end
+            tf = ~isempty(parentFolder) && exist(parentFolder, 'dir') == 7;
+        end
+
         function tf = hasLoadedRuntimeProject(app)
             tf = ~isempty(app.CurrentProject) && isa(app.CurrentProject, 'shallow');
         end
@@ -1496,6 +1544,12 @@ classdef pipeline2 < matlab.apps.AppBase
                     if ~isempty(pkg)
                         items{end+1} = pkg; %#ok<AGROW>
                     end
+                elseif strcmpi(nodeType, 'dataLoader')
+                    if ~isempty(pkg)
+                        items{end+1} = pkg; %#ok<AGROW>
+                    else
+                        items{end+1} = nodeType; %#ok<AGROW>
+                    end
                 else
                     items{end+1} = nodeType; %#ok<AGROW>
                 end
@@ -1514,7 +1568,13 @@ classdef pipeline2 < matlab.apps.AppBase
             end
             moduleType = app.AvailableModules{row,2};
             pkg = app.AvailableModules{row,3};
-            if any(strcmp(moduleType, {'roiPattern','roiManual','roiGrid','roiTracked'}))
+            if strcmpi(moduleType, 'dataLoader')
+                app.TypeDropDown.Value = 'dataLoader';
+                updateSubtypeChoices(app);
+                if any(strcmp(app.SubtypeDropDown.Items, pkg))
+                    app.SubtypeDropDown.Value = pkg;
+                end
+            elseif any(strcmp(moduleType, {'roiPattern','roiManual','roiGrid','roiTracked'}))
                 app.TypeDropDown.Value = 'ROI definition';
                 updateSubtypeChoices(app);
                 app.SubtypeDropDown.Value = moduleType;
@@ -1711,6 +1771,11 @@ classdef pipeline2 < matlab.apps.AppBase
             subtype = char(string(app.SubtypeDropDown.Value));
             pkg = '';
             switch lower(typeLabel)
+                case 'dataloader'
+                    nodeType = 'dataLoader';
+                    if ~isempty(subtype) && ~strcmpi(subtype, 'dataLoader')
+                        pkg = subtype;
+                    end
                 case 'roi definition'
                     nodeType = subtype;
                 case 'processor'
@@ -2222,7 +2287,11 @@ classdef pipeline2 < matlab.apps.AppBase
             pkg = canonicalModulePackageName(app, nodeType, pkg);
             switch lower(char(string(nodeType)))
                 case 'dataloader'
-                    f = 'dataLoader.process';
+                    if ~isempty(pkg) && ~strcmpi(char(string(pkg)), 'dataLoader') && ~isempty(which([char(string(pkg)) '.process']))
+                        f = [char(string(pkg)) '.process'];
+                    else
+                        f = 'dataLoader.process';
+                    end
                 case {'roipattern','roiidentify'}
                     f = 'roiPattern.process';
                 case 'roimanual'
@@ -2246,7 +2315,13 @@ classdef pipeline2 < matlab.apps.AppBase
             pkg = canonicalModulePackageName(app, nodeType, pkg);
             switch lower(char(string(nodeType)))
                 case 'dataloader'
-                    g = 'dataLoader.ui';
+                    if ~isempty(pkg) && ~strcmpi(char(string(pkg)), 'dataLoader') && ~isempty(which([char(string(pkg)) '.ui']))
+                        g = [char(string(pkg)) '.ui'];
+                    elseif isempty(pkg) || strcmpi(char(string(pkg)), 'dataLoader')
+                        g = 'dataLoader.ui';
+                    else
+                        g = '';
+                    end
                 case {'roipattern','roiidentify'}
                     g = 'roiPattern.ui';
                 case 'roimanual'
@@ -2269,7 +2344,11 @@ classdef pipeline2 < matlab.apps.AppBase
             ctxArg = struct();
             switch lower(char(string(nodeType)))
                 case 'dataloader'
-                    candidates = {'dataLoader.setparam'};
+                    if ~isempty(pkg) && ~strcmpi(char(string(pkg)), 'dataLoader')
+                        candidates = {[char(string(pkg)) '.setparam'], 'dataLoader.setparam'};
+                    else
+                        candidates = {'dataLoader.setparam'};
+                    end
                 case {'roipattern','roiidentify'}
                     candidates = {'roiPattern.setparam'};
                 case 'roimanual'
@@ -3149,7 +3228,13 @@ classdef pipeline2 < matlab.apps.AppBase
         function selectTypeControlsForNode(app, node)
             nodeType = char(string(getField(app, node, 'type', '')));
             pkg = char(string(getField(app, node, 'pkg', '')));
-            if any(strcmpi(nodeType, {'roiPattern','roiManual','roiGrid','roiTracked'}))
+            if strcmpi(nodeType, 'dataLoader')
+                app.TypeDropDown.Value = 'dataLoader';
+                updateSubtypeChoices(app);
+                if any(strcmp(app.SubtypeDropDown.Items, pkg))
+                    app.SubtypeDropDown.Value = pkg;
+                end
+            elseif any(strcmpi(nodeType, {'roiPattern','roiManual','roiGrid','roiTracked'}))
                 app.TypeDropDown.Value = 'ROI definition';
                 updateSubtypeChoices(app);
                 app.SubtypeDropDown.Value = nodeType;
@@ -5404,11 +5489,12 @@ classdef pipeline2 < matlab.apps.AppBase
             try, app.SmokeTestButton.Enable = 'on'; catch, end
 
             projectPath = strtrim(getRuntimeValue(app, 'projectPath'));
-            projectPathOk = ~isempty(projectPath) && (exist(projectPath, 'dir') == 7 || exist(projectPath, 'file') == 2);
             rawDataPath = strtrim(getRuntimeValue(app, 'rawDataPath'));
             rawOk = ~isempty(rawDataPath) && exist(rawDataPath, 'dir') == 7;
             startsFromProject = runtimeStartsFromExistingProject(app);
             startsFromClassifier = runtimeStartsFromClassifier(app);
+            allowProjectCreation = ~startsFromProject && ~startsFromClassifier;
+            projectPathOk = runtimeProjectPathUsable(app, projectPath, allowProjectCreation);
             loadedProjectOk = startsFromProject && hasLoadedRuntimeProject(app);
             projectOk = projectPathOk || loadedProjectOk;
 
@@ -5470,7 +5556,11 @@ classdef pipeline2 < matlab.apps.AppBase
                     setRuntimeButtonEnabled(app, 'channels', false);
                 end
             elseif ~isempty(projectPath) && ~projectPathOk && ~loadedProjectOk
-                markRuntimeField(app, 'projectPath', 'missing', 'Project must be an existing folder or project .mat file.');
+                if startsFromProject
+                    markRuntimeField(app, 'projectPath', 'missing', 'Project must be an existing folder or project .mat file.');
+                else
+                    markRuntimeField(app, 'projectPath', 'missing', 'Project target parent folder must exist or be creatable.');
+                end
             end
 
             if startsFromClassifier
@@ -7682,21 +7772,42 @@ classdef pipeline2 < matlab.apps.AppBase
                 spec = sam31.executionSpec(classiObj);
             catch
                 spec = struct();
-                spec.staticKeys = {'backend','resolution','maxNumObjects','videoScoreThreshold', ...
-                    'videoNewDetThreshold','videoAssocIouThreshold','sam31Runner', ...
+                spec.staticKeys = {'backend','resolution','maxNumObjects','chunkSize', ...
+                    'chunkOverlap','videoScoreThreshold', ...
+                    'videoNewDetThreshold','videoAssocIouThreshold', ...
+                    'hotstartUnmatchThreshold','sam31Runner', ...
                     'inferInstanceSegmentation','inferCellTracking', ...
-                    'inferBudPairing','budPairingSourceKey'};
+                    'inferBudPairing','budPairingSourceKey', ...
+                    'budPairingTypicalCellSize','budPairingMaxBirthAreaFraction', ...
+                    'budPairingMinParentAreaReferenceFraction', ...
+                    'budPairingMaxParentDistanceFraction', ...
+                    'budPairingMaxParentCentroidDistanceFraction', ...
+                    'budPairingFutureWindow','budPairingMinParentAgeFrames', ...
+                    'budPairingMaxFutureDistanceReferenceFraction', ...
+                    'budPairingMaxFutureCentroidDistanceReferenceFraction'};
                 spec.outputKeys = {};
                 spec.defaultImportKeys = spec.staticKeys;
                 spec.defaults = struct('backend', 'local', 'resolution', '280', ...
                     'maxNumObjects',40, ...
+                    'chunkSize',32, ...
+                    'chunkOverlap',4, ...
                     'videoScoreThreshold',0.4, 'videoNewDetThreshold',0.4, ...
                     'videoAssocIouThreshold',0.5, ...
+                    'hotstartUnmatchThreshold',3, ...
                     'sam31Runner', 'session', ...
                     'inferInstanceSegmentation', true, ...
                     'inferCellTracking', true, ...
                     'inferBudPairing', true, ...
-                    'budPairingSourceKey', '');
+                    'budPairingSourceKey', '', ...
+                    'budPairingTypicalCellSize', 0, ...
+                    'budPairingMaxBirthAreaFraction', 1.25, ...
+                    'budPairingMinParentAreaReferenceFraction', 0.7, ...
+                    'budPairingMaxParentDistanceFraction', 0.5, ...
+                    'budPairingMaxParentCentroidDistanceFraction', 1.0, ...
+                    'budPairingFutureWindow', 6, ...
+                    'budPairingMinParentAgeFrames', 6, ...
+                    'budPairingMaxFutureDistanceReferenceFraction', 1.0, ...
+                    'budPairingMaxFutureCentroidDistanceReferenceFraction', 1.0);
                 spec.labels = struct();
                 spec.tips = struct();
                 spec.choices = struct('backend', {{'local','wsl'}}, ...
@@ -8406,13 +8517,13 @@ classdef pipeline2 < matlab.apps.AppBase
             if isempty(idx)
                 return;
             end
-            [editorProject, ok, msg] = resolveRoiEditorProject(app);
+            node = app.Data.nodes(idx);
+            [editorProject, ok, msg] = resolveRoiEditorProject(app, node);
             if ~ok
                 uialert(app.UIFigure, msg, 'ROI editor', 'Icon', 'warning');
                 return;
             end
 
-            node = app.Data.nodes(idx);
             nodeType = lower(char(string(getField(app, node, 'type', ''))));
             ctx = buildRoiDefinitionEditorContext(app, node);
             ctx.shallow = editorProject;
@@ -8447,13 +8558,13 @@ classdef pipeline2 < matlab.apps.AppBase
             if isempty(idx)
                 return;
             end
-            [editorProject, ok, msg] = resolveRoiEditorProject(app);
+            node = app.Data.nodes(idx);
+            [editorProject, ok, msg] = resolveRoiEditorProject(app, node);
             if ~ok
                 uialert(app.UIFigure, msg, 'ROI workflow', 'Icon', 'warning');
                 return;
             end
 
-            node = app.Data.nodes(idx);
             focus = lower(char(string(getField(app, node, 'type', ''))));
             switch focus
                 case 'roiidentify'
@@ -8507,14 +8618,26 @@ classdef pipeline2 < matlab.apps.AppBase
             end
         end
 
-        function [editorProject, ok, msg] = resolveRoiEditorProject(app)
+        function [editorProject, ok, msg] = resolveRoiEditorProject(app, node)
             editorProject = [];
             ok = false;
             msg = '';
 
+            if nargin < 2
+                node = struct();
+            end
+
             mode = getRuntimeValue(app, 'inputSourceMode');
             if isempty(mode)
                 mode = 'existing_rois';
+            end
+
+            requiredFovCount = roiEditorRequiredFovCount(app, node);
+            if (~strcmpi(char(string(mode)), 'raw_dataloader') || requiredFovCount > 0) && ...
+                    currentProjectCanServeRoiEditor(app, requiredFovCount)
+                editorProject = app.CurrentProject;
+                ok = true;
+                return;
             end
 
             if ~strcmpi(char(string(mode)), 'raw_dataloader')
@@ -8537,13 +8660,71 @@ classdef pipeline2 < matlab.apps.AppBase
 
             try
                 editorProject = buildWorkflowProjectFromRawData(app, rawDataPath);
+                if requiredFovCount > 0 && numel(editorProject.fov) < requiredFovCount && ...
+                        currentProjectCanServeRoiEditor(app, requiredFovCount)
+                    editorProject = app.CurrentProject;
+                end
                 ok = ~isempty(editorProject) && isa(editorProject, 'shallow') && ...
-                    ~isempty(editorProject.fov) && ~isempty(editorProject.fov(1).srcpath);
+                        ~isempty(editorProject.fov) && ~isempty(editorProject.fov(1).srcpath);
                 if ~ok
                     msg = 'Raw data were parsed, but no displayable FOV was created.';
+                elseif requiredFovCount > 0 && numel(editorProject.fov) < requiredFovCount
+                    msg = sprintf(['The ROI editor project only exposes %d FOV(s), but this manual ROI ' ...
+                        'definition references FOV %d. Relink the project raw data or choose a raw/project ' ...
+                        'path that covers all selected FOVs.'], numel(editorProject.fov), requiredFovCount);
+                    ok = false;
                 end
             catch ME
                 msg = ['Could not create a temporary ROI workflow project from raw data: ' ME.message];
+            end
+        end
+
+        function tf = currentProjectCanServeRoiEditor(app, requiredFovCount)
+            tf = false;
+            if isempty(app.CurrentProject) || ~isa(app.CurrentProject, 'shallow')
+                return;
+            end
+            try
+                if isempty(app.CurrentProject.fov)
+                    return;
+                end
+                if nargin >= 2 && ~isempty(requiredFovCount) && requiredFovCount > 0 && ...
+                        numel(app.CurrentProject.fov) < requiredFovCount
+                    return;
+                end
+                tf = projectHasFovImageSources(app, app.CurrentProject);
+            catch
+                tf = false;
+            end
+        end
+
+        function n = roiEditorRequiredFovCount(app, node) %#ok<INUSD>
+            n = 0;
+            params = getField(app, node, 'params', struct());
+            if ~isstruct(params) || isempty(params)
+                return;
+            end
+            fovIdx = [];
+            if isfield(params, 'manualRois') && isstruct(params.manualRois) && ~isempty(params.manualRois)
+                for i = 1:numel(params.manualRois)
+                    try
+                        if isfield(params.manualRois(i), 'fovIndex') && ~isempty(params.manualRois(i).fovIndex)
+                            fovIdx(end+1) = round(double(params.manualRois(i).fovIndex(1))); %#ok<AGROW>
+                        end
+                    catch
+                    end
+                end
+            end
+            if isempty(fovIdx) && isfield(params, 'fovIndex') && ~isempty(params.fovIndex)
+                try
+                    fovIdx = reshape(round(double(params.fovIndex)), 1, []);
+                catch
+                    fovIdx = [];
+                end
+            end
+            fovIdx = fovIdx(isfinite(fovIdx) & fovIdx >= 1);
+            if ~isempty(fovIdx)
+                n = max(fovIdx);
             end
         end
 
@@ -10229,10 +10410,24 @@ classdef pipeline2 < matlab.apps.AppBase
                     end
                 end
             end
-            if ~isempty(currentSeries)
+            keepCurrentSeries = ~isempty(currentSeries);
+            if keepCurrentSeries && isSymbolicDataSeriesLabelForUi(app, currentSeries) && ...
+                    ~symbolicSeriesSourceExistsForUi(app, currentSeries) && ~isempty(out)
+                keepCurrentSeries = false;
+            end
+            if keepCurrentSeries
                 out = [{currentSeries} out]; %#ok<AGROW>
             end
             choices = unique(out(~cellfun(@isempty, out)), 'stable');
+        end
+
+        function tf = symbolicSeriesSourceExistsForUi(app, seriesName)
+            sourceNodeId = symbolicSeriesSourceNodeForUi(app, seriesName);
+            if isempty(sourceNodeId)
+                tf = true;
+                return;
+            end
+            tf = ~isempty(app.Data.nodes) && any(strcmp(cellstr(string({app.Data.nodes.id})), sourceNodeId));
         end
 
         function label = stripDataSeriesVariableSuffixFromSymbolicLabel(app, label) %#ok<INUSD>
@@ -12373,6 +12568,12 @@ classdef pipeline2 < matlab.apps.AppBase
             keyLower = lower(char(string(key)));
             enableState = ternary(app, editable, 'on', 'off');
 
+            if isBooleanParamKey(app, node, key) && isEmptyParamValue(app, value)
+                defaults = defaultNodeParams(app, nodeType, getField(app, node, 'pkg', ''));
+                if isstruct(defaults) && isfield(defaults, key)
+                    value = normalizeMissingParamValue(app, defaults.(key));
+                end
+            end
             valueText = safeScalarText(app, value);
             if islogical(value) || any(strcmpi(valueText, {'true','false'})) || isBooleanParamKey(app, node, key)
                 ctrl = uicheckbox(parent, 'Text', '');
@@ -12457,6 +12658,17 @@ classdef pipeline2 < matlab.apps.AppBase
             ctrl.Value = paramValueToDisplay(app, node, key, value);
             ctrl.Enable = enableState;
             ctrl.ValueChangedFcn = @(src,~)paramControlChanged(app, node, key, src.Value, scope);
+        end
+
+        function tf = isEmptyParamValue(app, value)
+            value = normalizeMissingParamValue(app, value);
+            if isempty(value)
+                tf = true;
+            elseif ischar(value) || (isstring(value) && isscalar(value))
+                tf = isempty(strtrim(char(string(value))));
+            else
+                tf = false;
+            end
         end
 
         function tf = paramUsesFolderBrowser(app, node, key, value, scope) %#ok<INUSD>
@@ -12651,6 +12863,8 @@ classdef pipeline2 < matlab.apps.AppBase
                     pkg = lower(char(string(getField(app, node, 'pkg', ''))));
                     if strcmp(pkg, 'combinemultiplechannels') && strcmp(keyLower, 'mode')
                         choices = {'additive','subtraction','division'};
+                    elseif strcmp(pkg, 'computemetrics') && strcmp(keyLower, 'backgroundmethod')
+                        choices = {'mean','median','percentile'};
                     elseif strcmp(pkg, 'computemetrics') && ~isempty(regexp(keyLower, '^mask\d+_backgroundlabel$', 'once'))
                         choices = {'auto','0','1'};
                     elseif strcmp(pkg, 'computerls') && strcmp(keyLower, 'statedecoder')
@@ -13815,10 +14029,11 @@ classdef pipeline2 < matlab.apps.AppBase
             issues = {};
             projectPath = strtrim(getRuntimeValue(app, 'projectPath'));
             rawDataPath = strtrim(getRuntimeValue(app, 'rawDataPath'));
-            projectPathOk = ~isempty(projectPath) && (exist(projectPath, 'dir') == 7 || exist(projectPath, 'file') == 2);
             rawOk = ~isempty(rawDataPath) && exist(rawDataPath, 'dir') == 7;
             startsFromProject = runtimeStartsFromExistingProject(app);
             startsFromClassifier = runtimeStartsFromClassifier(app);
+            allowProjectCreation = ~startsFromProject && ~startsFromClassifier;
+            projectPathOk = runtimeProjectPathUsable(app, projectPath, allowProjectCreation);
             loadedProjectOk = startsFromProject && hasLoadedRuntimeProject(app);
             projectOk = projectPathOk || loadedProjectOk;
             rawStartNodeIds = selectedRunNodeIdsByType(app, {'dataloader','roigrid','roiidentify','roimanual','roipattern','roiextract'});
@@ -13830,8 +14045,13 @@ classdef pipeline2 < matlab.apps.AppBase
             end
 
             if ~isempty(projectPath) && ~projectPathOk && ~loadedProjectOk
-                issues{end+1} = ['Project path does not exist: ' projectPath]; %#ok<AGROW>
-                markRuntimeField(app, 'projectPath', 'missing', 'Project must be an existing folder or project .mat file.');
+                if startsFromProject
+                    issues{end+1} = ['Project path does not exist: ' projectPath]; %#ok<AGROW>
+                    markRuntimeField(app, 'projectPath', 'missing', 'Project must be an existing folder or project .mat file.');
+                else
+                    issues{end+1} = ['Project target cannot be created: ' projectPath]; %#ok<AGROW>
+                    markRuntimeField(app, 'projectPath', 'missing', 'Project target parent folder must exist or be creatable.');
+                end
             end
 
             if startsFromProject
@@ -13882,9 +14102,21 @@ classdef pipeline2 < matlab.apps.AppBase
                 elseif ~isempty(rawDataPath) && ~rawOk
                     issues{end+1} = ['Raw data folder does not exist: ' rawDataPath]; %#ok<AGROW>
                     markRuntimeField(app, 'rawDataPath', 'missing', 'Raw data must be an existing folder.');
-                elseif rawOk && rawParserIsCurrent(app, rawDataPath) && rawParserHasNoChannels(app) && selectedRunNeedsChannels(app)
-                    issues{end+1} = 'Raw parser did not detect any channel, but selected modules need image/ROI channels.'; %#ok<AGROW>
-                    markRuntimeField(app, 'rawDataPath', 'warning', 'The raw parser is the channel authority in raw data mode. Check parser filters or raw metadata before running channel-dependent modules.');
+                elseif rawOk
+                    if ~rawParserIsCurrent(app, rawDataPath)
+                        parseRuntimeRawDataPath(app, rawDataPath);
+                    end
+                    if rawParserIsCurrent(app, rawDataPath) && rawParserHasNoChannels(app) && selectedRunNeedsChannels(app)
+                        issues{end+1} = 'Raw parser did not detect any channel, but selected modules need image/ROI channels.'; %#ok<AGROW>
+                        markRuntimeField(app, 'rawDataPath', 'warning', 'The raw parser is the channel authority in raw data mode. Check parser filters or raw metadata before running channel-dependent modules.');
+                    elseif ~rawParserIsCurrent(app, rawDataPath)
+                        msg = '';
+                        if isfield(app.RuntimeParseInfo, 'message')
+                            msg = char(string(app.RuntimeParseInfo.message));
+                        end
+                        issues{end+1} = ['Raw parser did not resolve FOV/frame/channel inventory before launch' ternary(app, isempty(msg), '.', [': ' msg])]; %#ok<AGROW>
+                        markRuntimeField(app, 'rawDataPath', 'missing', 'Raw data inventory must be parsed before launching this run.');
+                    end
                 end
                 if rawOk && rawParserIsCurrent(app, rawDataPath) && isfield(app.RuntimeParseInfo, 'fovCount') && app.RuntimeParseInfo.fovCount > 0
                     selectedFovs = parseIndexSelection(app, getRuntimeValue(app, 'fovs'));
@@ -15398,6 +15630,23 @@ classdef pipeline2 < matlab.apps.AppBase
             ctx.run.frames = ctx.sel.frames;
             ctx.run.rois = ctx.sel.rois;
 
+            if runtimeStartsFromExistingProject(app) && ~isempty(app.CurrentProject) && isa(app.CurrentProject, 'shallow')
+                try
+                    projectFovs = app.CurrentProject.fov;
+                    fovIdx = ctx.sel.fovs;
+                    if isempty(fovIdx)
+                        fovIdx = 1:numel(projectFovs);
+                    else
+                        fovIdx = fovIdx(fovIdx >= 1 & fovIdx <= numel(projectFovs));
+                    end
+                    if ~isempty(fovIdx)
+                        ctx.fovList = projectFovs(fovIdx);
+                        ctx.images = ctx.fovList;
+                    end
+                catch
+                end
+            end
+
             updateRunSaveProgress(app, progressDlg, 'Preparing run: scanning available channels...', 0.36);
             sourceRuntimeChannels = runtimeSourceChannels(app);
             if hubExecution
@@ -15467,6 +15716,11 @@ classdef pipeline2 < matlab.apps.AppBase
             ctx.projectPath = projectPath;
             ctx.run.useExistingProjectSources = useProjectSources;
             ctx.dataLoader = struct('path', rawDataPath, 'useExistingProjectSources', useProjectSources);
+            inventory = runtimeInventorySnapshot(app, rawDataPath);
+            if isstruct(inventory) && isfield(inventory, 'ok') && logical(inventory.ok)
+                ctx.run.runtimeInventory = inventory;
+                ctx.runtimeInventory = inventory;
+            end
 
             updateRunSaveProgress(app, progressDlg, 'Preparing run: building pipeline snapshot...', 0.80);
             ctx.pipelineSpec = buildPipelineStruct(app);
@@ -15489,6 +15743,53 @@ classdef pipeline2 < matlab.apps.AppBase
                 if ~isempty(projectRawPath)
                     rawDataPath = projectRawPath;
                 end
+            end
+        end
+
+        function info = runtimeInventorySnapshot(app, rawDataPath)
+            if nargin < 2
+                rawDataPath = effectiveRuntimeRawDataPath(app);
+            end
+            rawDataPath = strtrim(char(string(rawDataPath)));
+            info = struct('path', rawDataPath, 'ok', true, 'message', '', ...
+                'datatype', '', 'fovCount', 0, 'fovNames', {{}}, 'maxFrame', [], 'channels', {{}});
+
+            if isfield(app.RuntimeParseInfo, 'ok') && logical(app.RuntimeParseInfo.ok)
+                parsed = normalizeRuntimeInventoryInfo(app, app.RuntimeParseInfo);
+                if isempty(rawDataPath) || isempty(parsed.path) || strcmp(char(string(parsed.path)), rawDataPath)
+                    info = parsed;
+                    if isempty(info.path)
+                        info.path = rawDataPath;
+                    end
+                    return;
+                end
+            end
+
+            if runtimeStartsFromExistingProject(app) && ~isempty(app.CurrentProject) && isa(app.CurrentProject, 'shallow')
+                projectInfo = summarizeExistingProjectRuntime(app);
+                if isfield(projectInfo, 'fovCount') && projectInfo.fovCount > 0
+                    info.fovCount = projectInfo.fovCount;
+                    info.fovNames = projectInfo.fovNames;
+                end
+                if isfield(projectInfo, 'maxFrame') && ~isempty(projectInfo.maxFrame)
+                    info.maxFrame = projectInfo.maxFrame;
+                end
+            else
+                selectedFovs = parseIndexSelection(app, getRuntimeValue(app, 'fovs'));
+                if ~isempty(selectedFovs)
+                    info.fovCount = max(selectedFovs(:));
+                    info.fovNames = arrayfun(@(k)sprintf('FOV %d', k), 1:info.fovCount, 'UniformOutput', false);
+                end
+                selectedFrames = parseIndexSelection(app, getRuntimeValue(app, 'frames'));
+                if ~isempty(selectedFrames)
+                    info.maxFrame = max(selectedFrames(:));
+                end
+            end
+
+            info.channels = runtimeConcreteChannels(app);
+            if isempty(info.channels) && info.fovCount <= 0 && isempty(info.maxFrame)
+                info.ok = false;
+                info.message = 'No runtime inventory available at save time.';
             end
         end
 
@@ -17208,6 +17509,12 @@ classdef pipeline2 < matlab.apps.AppBase
                 app.RuntimeValues.runId = suggested;
             catch
             end
+            try
+                app.ResumeoptionsDropDown.Value = 'Restart from scratch';
+                app.RuntimeValues.outputPolicyUserChosen = false;
+                applyRecommendedOutputPolicyForResume(app);
+            catch
+            end
             app.RunButton.Text = 'Run !';
         end
 
@@ -18142,6 +18449,7 @@ classdef pipeline2 < matlab.apps.AppBase
                 bindProjectFromPath(app, [runObj.projectPath '.mat'], false);
             end
             app.RuntimeInventoryRefreshSuspended = wasSuspended;
+            hydrateRuntimeInventoryFromRunContext(app, ctx);
             if ~wasSuspended
                 updateRuntimeResourceInventory(app);
             end
@@ -18171,6 +18479,161 @@ classdef pipeline2 < matlab.apps.AppBase
                 end
             catch
                 app.RunButton.Text = 'Run !';
+            end
+        end
+
+        function hydrateRuntimeInventoryFromRunContext(app, ctx)
+            if ~isstruct(ctx)
+                return;
+            end
+
+            savedSelections = struct( ...
+                'fovs', getRuntimeValue(app, 'fovs'), ...
+                'frames', getRuntimeValue(app, 'frames'), ...
+                'rois', getRuntimeValue(app, 'rois'));
+            cleanupObj = onCleanup(@()restoreRuntimeSelectionText(app, savedSelections)); %#ok<NASGU>
+
+            info = runtimeInventoryFromRunContext(app, ctx);
+            if isstruct(info) && isfield(info, 'ok') && logical(info.ok)
+                app.RuntimeParseInfo = info;
+                applyRuntimeParseInfo(app, info);
+            end
+
+            mode = runtimeInputModeFromRunContext(app, ctx);
+            if isempty(mode)
+                mode = getRuntimeValue(app, 'inputSourceMode');
+            end
+            if ~strcmpi(mode, 'raw_dataloader')
+                return;
+            end
+
+            rawDataPath = '';
+            if isfield(ctx, 'run') && isstruct(ctx.run) && isfield(ctx.run, 'rawDataPath')
+                rawDataPath = strtrim(char(string(ctx.run.rawDataPath)));
+            end
+            if isempty(rawDataPath) && isfield(ctx, 'rawDataPath')
+                rawDataPath = strtrim(char(string(ctx.rawDataPath)));
+            end
+            if isempty(rawDataPath) || ~(exist(rawDataPath, 'dir') == 7 || exist(rawDataPath, 'file') == 2)
+                return;
+            end
+
+            if ~rawParserIsCurrent(app, rawDataPath)
+                parseRuntimeRawDataPath(app, rawDataPath);
+            end
+        end
+
+        function restoreRuntimeSelectionText(app, savedSelections)
+            if ~isstruct(savedSelections)
+                return;
+            end
+            keys = {'fovs','frames','rois'};
+            for i = 1:numel(keys)
+                key = keys{i};
+                if isfield(savedSelections, key)
+                    value = strtrim(char(string(savedSelections.(key))));
+                    if ~isempty(value)
+                        setRuntimeValuePreserveParse(app, key, value);
+                    end
+                end
+            end
+        end
+
+        function info = runtimeInventoryFromRunContext(app, ctx) %#ok<INUSD>
+            info = struct();
+            if ~isstruct(ctx)
+                return;
+            end
+
+            candidates = {};
+            if isfield(ctx, 'run') && isstruct(ctx.run) && isfield(ctx.run, 'runtimeInventory')
+                candidates{end+1} = ctx.run.runtimeInventory; %#ok<AGROW>
+            end
+            if isfield(ctx, 'runtimeInventory')
+                candidates{end+1} = ctx.runtimeInventory; %#ok<AGROW>
+            end
+            for i = 1:numel(candidates)
+                candidate = normalizeRuntimeInventoryInfo(app, candidates{i});
+                if isstruct(candidate) && isfield(candidate, 'ok') && logical(candidate.ok)
+                    info = candidate;
+                    return;
+                end
+            end
+
+            rawDataPath = '';
+            if isfield(ctx, 'run') && isstruct(ctx.run) && isfield(ctx.run, 'rawDataPath')
+                rawDataPath = strtrim(char(string(ctx.run.rawDataPath)));
+            end
+            if isempty(rawDataPath) && isfield(ctx, 'rawDataPath')
+                rawDataPath = strtrim(char(string(ctx.rawDataPath)));
+            end
+
+            channels = {};
+            if isfield(ctx, 'run') && isstruct(ctx.run) && isfield(ctx.run, 'availableChannels')
+                channels = normalizeChannelCellText(app, ctx.run.availableChannels);
+            end
+            if isempty(channels) && isfield(ctx, 'channels')
+                channels = normalizeChannelCellText(app, ctx.channels);
+            end
+            if isempty(channels) && isfield(ctx, 'roiChannels')
+                channels = normalizeChannelCellText(app, ctx.roiChannels);
+            end
+
+            fovCount = [];
+            maxFrame = [];
+            if isfield(ctx, 'sel') && isstruct(ctx.sel)
+                if isfield(ctx.sel, 'fovs') && isnumeric(ctx.sel.fovs) && ~isempty(ctx.sel.fovs)
+                    fovCount = max(ctx.sel.fovs(:));
+                end
+                if isfield(ctx.sel, 'frames') && isnumeric(ctx.sel.frames) && ~isempty(ctx.sel.frames)
+                    maxFrame = max(ctx.sel.frames(:));
+                end
+            end
+            if isempty(fovCount) && isfield(ctx, 'run') && isstruct(ctx.run) && isfield(ctx.run, 'fovIndex') && isnumeric(ctx.run.fovIndex) && ~isempty(ctx.run.fovIndex)
+                fovCount = max(ctx.run.fovIndex(:));
+            end
+            if isempty(maxFrame) && isfield(ctx, 'run') && isstruct(ctx.run) && isfield(ctx.run, 'frames') && isnumeric(ctx.run.frames) && ~isempty(ctx.run.frames)
+                maxFrame = max(ctx.run.frames(:));
+            end
+
+            if isempty(channels) && isempty(fovCount) && isempty(maxFrame)
+                return;
+            end
+            info = struct('path', rawDataPath, 'ok', true, 'message', 'Restored from run snapshot.', ...
+                'datatype', '', 'fovCount', 0, 'fovNames', {{}}, 'maxFrame', [], 'channels', {channels});
+            if ~isempty(fovCount) && isfinite(double(fovCount)) && double(fovCount) > 0
+                info.fovCount = round(double(fovCount));
+                info.fovNames = arrayfun(@(k)sprintf('FOV %d', k), 1:info.fovCount, 'UniformOutput', false);
+            end
+            if ~isempty(maxFrame) && isfinite(double(maxFrame)) && double(maxFrame) > 0
+                info.maxFrame = round(double(maxFrame));
+            end
+        end
+
+        function info = normalizeRuntimeInventoryInfo(app, value) %#ok<INUSD>
+            info = struct();
+            if ~isstruct(value)
+                return;
+            end
+            info = struct('path', '', 'ok', true, 'message', '', ...
+                'datatype', '', 'fovCount', 0, 'fovNames', {{}}, 'maxFrame', [], 'channels', {{}});
+            if isfield(value, 'path'), info.path = char(string(value.path)); end
+            if isfield(value, 'ok'), info.ok = logical(value.ok); end
+            if isfield(value, 'message'), info.message = char(string(value.message)); end
+            if isfield(value, 'datatype'), info.datatype = char(string(value.datatype)); end
+            if isfield(value, 'fovCount') && ~isempty(value.fovCount)
+                info.fovCount = round(double(value.fovCount(1)));
+            end
+            if isfield(value, 'fovNames') && ~isempty(value.fovNames)
+                info.fovNames = cellstr(string(value.fovNames(:)'));
+            elseif info.fovCount > 0
+                info.fovNames = arrayfun(@(k)sprintf('FOV %d', k), 1:info.fovCount, 'UniformOutput', false);
+            end
+            if isfield(value, 'maxFrame') && ~isempty(value.maxFrame)
+                info.maxFrame = round(double(value.maxFrame(1)));
+            end
+            if isfield(value, 'channels')
+                info.channels = normalizeChannelCellText(app, value.channels);
             end
         end
 
@@ -18655,6 +19118,18 @@ classdef pipeline2 < matlab.apps.AppBase
                 [runObj, msg] = pipelineRunLoad(fullfile(pth, file));
                 if isempty(runObj)
                     error('pipeline2:RunLoadFailed', '%s', msg);
+                end
+                [pipeFromRun, resolveMsg] = resolvePipelineFromRunForUi(app, runObj);
+                if isempty(pipeFromRun)
+                    if ~isempty(resolveMsg)
+                        uialert(app.UIFigure, resolveMsg, 'Load run', 'Icon', 'warning');
+                    end
+                else
+                    loadPipelineFromObject(app, pipeFromRun, false);
+                    try
+                        addRecentPipelinePath(app, fullfile(pipeFromRun.path, 'pipeline.json'));
+                    catch
+                    end
                 end
                 loadRunIntoUi(app, runObj);
             catch ME

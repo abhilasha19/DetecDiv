@@ -29,25 +29,14 @@ switch mode
 
         if layoutOptions.overlay
             tileIndex = 1;
-          %  set(graphicsHandles.imgHandles(tileIndex), 'CData', displayImage);
 
             h = localImageHandle(graphicsHandles.imgHandles(tileIndex));
-            if ~isequal(get(h, 'CData'), displayImage)
-                set(h, 'CData', displayImage);
-            end
+            set(h, 'CData', displayImage);
 
             h = graphicsHandles.overlayHandles(tileIndex);
-            if ~isequal(get(h, 'CData'), indexedOverlay)
-                set(h, 'CData', indexedOverlay);
-            end
-            if ~isequal(get(h, 'AlphaData'), alphaOverlay)
-                set(h, 'AlphaData', alphaOverlay, 'AlphaDataMapping', 'none');
-            end
-
-
-
-            %set(graphicsHandles.overlayHandles(tileIndex),'CData', indexedOverlay);
-            %set(graphicsHandles.overlayHandles(tileIndex), 'AlphaData', alphaOverlay, 'AlphaDataMapping', 'none');
+            set(h, 'CData', indexedOverlay);
+            set(h, 'AlphaData', alphaOverlay, 'AlphaDataMapping', 'none');
+            localRefreshScaleBars(graphicsHandles, tileIndex, h.Parent, layoutOptions);
         else
             for ch = 1:layoutOptions.Nchannel
                 local_row = 1;
@@ -80,7 +69,7 @@ switch mode
                     wid= layoutOptions.Nchannel*layoutOptions.Nbrick;
                 end
 
-                ax = nexttile(masterTL, tileIndex, [1, wid]);
+                ax = localDataAxis(graphicsHandles, masterTL, tileIndex, [1, wid]);
 
                 % if layoutOptions.Ndataseries>1 && ds~=layoutOptions.Ndataseries
                 %     set(ax,'XTickLabel',[]);
@@ -153,12 +142,8 @@ switch mode
                     if isKey(graphicsHandles.imgHandles, tileIndex)
                         h = localImageHandle(graphicsHandles.imgHandles(tileIndex));
                         set(h, 'CData', displayImage);
-                    end
-
-                    if isKey(graphicsHandles.imgHandles, tileIndex)
-                        h = localImageHandle(graphicsHandles.imgHandles(tileIndex));
-                        set(h, 'CData', displayImage(:,:,:,1));
                         ax=h.Parent;
+                        localRefreshScaleBars(graphicsHandles, tileIndex, ax, layoutOptions);
 
                         [htext, hvector]=score_displayVectorGraphics(ax, newframe, 1, vContours , layoutOptions);
                         graphicsHandles.vectorHandles(tileIndex)=[htext hvector];
@@ -206,7 +191,7 @@ switch mode
                             wid= layoutOptions.Nchannel*layoutOptions.Nbrick;
                         end
 
-                        ax = nexttile(masterTL, tileIndex, [1, wid]);
+                        ax = localDataAxis(graphicsHandles, masterTL, tileIndex, [1, wid]);
 
                         % if layoutOptions.Ndataseries>1 && ds~=layoutOptions.Ndataseries
                         % %     set(ax,'XTickLabel',[]);
@@ -225,7 +210,7 @@ switch mode
                         
                         updateDataPanels(ax,ds, layoutOptions,newframe,hLineAll,roiData);
                        % newframe
-                        fra=newframe+layoutOptions.frames(1)-1;
+                        fra=localMovieFrameValue(layoutOptions, newframe);
                         updateMarkers(hLineAll, fra , layoutOptions);
 
                         %   title(sprintf('Data:%d', ds));
@@ -355,9 +340,33 @@ if isempty(h) || ~isgraphics(h) || ~isa(h, 'matlab.graphics.primitive.Image')
 end
 end
 
+function ax = localDataAxis(graphicsHandles, masterTL, tileIndex, tileSpan)
+ax = [];
+try
+    if isfield(graphicsHandles, 'dataAxes') && ~isempty(graphicsHandles.dataAxes) && ...
+            isKey(graphicsHandles.dataAxes, tileIndex)
+        candidate = graphicsHandles.dataAxes(tileIndex);
+        if ~isempty(candidate) && isgraphics(candidate)
+            ax = candidate;
+            return;
+        end
+    end
+catch
+    ax = [];
+end
+
+ax = nexttile(masterTL, tileIndex, tileSpan);
+try
+    if isfield(graphicsHandles, 'dataAxes') && ~isempty(graphicsHandles.dataAxes)
+        graphicsHandles.dataAxes(tileIndex) = ax;
+    end
+catch
+end
+end
+
 function localRefreshScaleBar(graphicsHandles, tileIndex, ax, layoutOptions, ch)
 if isempty(graphicsHandles) || ~isfield(graphicsHandles, 'scaleBarHandles') || ...
-        isempty(graphicsHandles.scaleBarHandles) || isempty(ax) || ~isgraphics(ax)
+        isempty(ax) || ~isgraphics(ax)
     return;
 end
 
@@ -378,6 +387,42 @@ if isKey(graphicsHandles.scaleBarHandles, tileIndex)
 end
 
 newHandles = score_drawChannelScaleBar(ax, layoutOptions, ch);
+if ~isempty(newHandles)
+    graphicsHandles.scaleBarHandles(tileIndex) = newHandles;
+end
+end
+
+function localRefreshScaleBars(graphicsHandles, tileIndex, ax, layoutOptions)
+if isempty(graphicsHandles) || ~isfield(graphicsHandles, 'scaleBarHandles') || ...
+        isempty(ax) || ~isgraphics(ax)
+    return;
+end
+
+if isKey(graphicsHandles.scaleBarHandles, tileIndex)
+    oldHandles = graphicsHandles.scaleBarHandles(tileIndex);
+    if ~isempty(oldHandles)
+        delete(oldHandles(isgraphics(oldHandles)));
+    end
+    remove(graphicsHandles.scaleBarHandles, tileIndex);
+end
+
+if ~isfield(layoutOptions, 'scale') || isempty(layoutOptions.scale)
+    return;
+end
+
+nCh = numel(layoutOptions.scale);
+if isfield(layoutOptions, 'Nchannel') && ~isempty(layoutOptions.Nchannel)
+    nCh = min(nCh, layoutOptions.Nchannel);
+end
+scaledChannels = find(logical(layoutOptions.scale(1:nCh)));
+offsetCount = numel(scaledChannels);
+newHandles = gobjects(0);
+for i = 1:offsetCount
+    h = score_drawChannelScaleBar(ax, layoutOptions, scaledChannels(i), i, offsetCount);
+    if ~isempty(h)
+        newHandles = [newHandles h]; %#ok<AGROW>
+    end
+end
 if ~isempty(newHandles)
     graphicsHandles.scaleBarHandles(tileIndex) = newHandles;
 end
@@ -426,8 +471,17 @@ for j = 1:numel(hMarkers)
     if isempty(linkedLine) || ~isgraphics(linkedLine)
         newY{j} = NaN;
     else
+        xLine = linkedLine.XData;
         yLine = linkedLine.YData;
-        if fIdx <= numel(yLine)
+        if numel(xLine) == numel(yLine) && ~isempty(xLine)
+            [~, idx] = min(abs(double(xLine) - xMarker));
+            tol = max(eps, 0.5 * max(eps, double(layoutOptions.framerate)));
+            if ~isempty(idx) && abs(double(xLine(idx)) - xMarker) <= tol
+                newY{j} = yLine(idx);
+            else
+                newY{j} = NaN;
+            end
+        elseif fIdx <= numel(yLine)
             newY{j} = yLine(fIdx);
         else
             newY{j} = NaN;
@@ -443,6 +497,52 @@ else
     for j = 1:numel(hMarkers)
         set(hMarkers(j), 'XData', newX{j}, 'YData', newY{j});
     end
+end
+end
+
+function signature = localPanelDataSignature(xdata, ydata)
+try
+    y = double(ydata(:));
+    x = double(xdata(:));
+    yFinite = y(isfinite(y));
+    xFinite = x(isfinite(x));
+    if isempty(yFinite)
+        yStats = [NaN NaN NaN NaN];
+    else
+        yStats = [sum(yFinite), sum(abs(yFinite)), yFinite(1), yFinite(end)];
+    end
+    if isempty(xFinite)
+        xStats = [NaN NaN NaN NaN];
+    else
+        xStats = [sum(xFinite), sum(abs(xFinite)), xFinite(1), xFinite(end)];
+    end
+    signature = [size(ydata,1), size(ydata,2), numel(xdata), xStats, yStats];
+catch
+    signature = [];
+end
+end
+
+function value = localAxesUserDataField(ax, fieldName, defaultValue)
+value = defaultValue;
+try
+    ud = ax.UserData;
+    if isstruct(ud) && isfield(ud, fieldName)
+        value = ud.(fieldName);
+    end
+catch
+    value = defaultValue;
+end
+end
+
+function localSetAxesUserDataField(ax, fieldName, value)
+try
+    ud = ax.UserData;
+    if ~isstruct(ud)
+        ud = struct();
+    end
+    ud.(fieldName) = value;
+    ax.UserData = ud;
+catch
 end
 end
 
@@ -527,55 +627,19 @@ end
 lineIdx = find(arrayfun(@(h) isgraphics(h) && isa(h, 'matlab.graphics.chart.primitive.Line'), hLineAll));
 nLines = min(numel(lineIdx), size(ydata,2));
 
-for i = 1:nLines
-    h = hLineAll(lineIdx(i));
-    set(h, 'XData', xdata, 'YData', ydata(:, i));
-end
+dataSignature = localPanelDataSignature(xdata, ydata);
+cachedSignature = localAxesUserDataField(ax, 'scoreDataSignature', []);
+lineDataChanged = isempty(cachedSignature) || ~isequaln(cachedSignature, dataSignature) || nLines < size(ydata, 2);
 
-% ------------------------------------------------------------
-% 2) Mettre à jour les marqueurs (leurs positions), si présents
-% ------------------------------------------------------------
-markerIdx = find(arrayfun(@(h) isgraphics(h) && isa(h, 'matlab.graphics.chart.primitive.Line') && ...
-    ~isempty(h.Marker) && h.Marker ~= "none", hLineAll));
-
-if ~isempty(markerIdx) && ~isempty(layoutOptions.frames)
-    cc = 1;
-    for k = 1:length(layoutOptions.frames)
-        fIdx = layoutOptions.frames(k);
-
-        if layoutOptions.timeOffset
-            xMarker = (fIdx - layoutOptions.frames(1)) * layoutOptions.framerate;
-            fRel = fIdx - layoutOptions.frames(1) + 1;
-        else
-            xMarker = fIdx * layoutOptions.framerate;
-            fRel = fIdx;
-        end
-
-        markerIdxInData = [];
-        if clipToMovie
-            [~, markerIdxInData] = min(abs(xdata - xMarker));
-            if isempty(markerIdxInData) || abs(xdata(markerIdxInData) - xMarker) > max(eps, 0.5 * layoutOptions.framerate)
-                markerIdxInData = [];
-            end
-        elseif fRel >= 1 && fRel <= size(ydata,1)
-            markerIdxInData = fRel;
-        end
-
-        if ~isempty(markerIdxInData)
-            for j = 1:nLines
-                if cc <= numel(markerIdx)
-                    hm = hLineAll(markerIdx(cc));
-                    set(hm, 'XData', xMarker, 'YData', ydata(markerIdxInData, j), ...
-                        'MarkerSize', max(4, floor(0.6 * layoutOptions.fontSize)));
-                    cc = cc + 1;
-                end
-            end
-        end
+if lineDataChanged
+    for i = 1:nLines
+        h = hLineAll(lineIdx(i));
+        set(h, 'XData', xdata, 'YData', ydata(:, i));
     end
+    localSetAxesUserDataField(ax, 'scoreDataSignature', dataSignature);
 end
 
-% ------------------------------------------------------------
-% 3) Si c'est un panel categorical, forcer Y ticks/labels stables
+% 2) Si c'est un panel categorical, forcer Y ticks/labels stables
 %    (on prend la 1ère colonne comme référence)
 % ------------------------------------------------------------
 if ~isempty(yTickInfo) && ~isempty(yTickInfo.isLabel) && any(yTickInfo.isLabel)
@@ -590,7 +654,7 @@ if ~isempty(yTickInfo) && ~isempty(yTickInfo.isLabel) && any(yTickInfo.isLabel)
 end
 
 % ------------------------------------------------------------
-% 4) Opacité mode trajectoire / ou tracking XLim
+% 3) Opacité mode trajectoire / ou tracking XLim
 % ------------------------------------------------------------
 if isgraphics(hLineAll(1)) && isa(hLineAll(1), 'matlab.graphics.primitive.Image')
     % Mode trajectoire

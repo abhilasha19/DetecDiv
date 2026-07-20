@@ -1,0 +1,27 @@
+{
+  "id": "load_phylocell",
+  "type": "dataLoader",
+  "pkg": "phyloCellLoader",
+  "func": "phyloCellLoader.process",
+  "params": {
+    "positionFilter": [],
+    "channelFilter": [],
+    "stackFilter": [],
+    "label": "",
+    "write": true,
+    "interactive": false,
+    "useExistingProjectSources": false,
+    "projectPath": "",
+    "projectName": "",
+    "includeContours": false,
+    "segmentationPolicy": "prefer_autotrack"
+  },
+  "inputs": [],
+  "outputs": [
+    "shallow",
+    "fovList",
+    "channels",
+    "annotations"
+  ],
+  "updatedAt": "15-Jul-2026 09:13:06"
+}

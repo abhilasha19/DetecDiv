@@ -7,6 +7,7 @@ import platform
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -80,26 +81,41 @@ def latest_checkpoint(classifier_root: Path | None, image_size: int, kind: str) 
         direct = artifacts / f"moma_sam31_image_instance_prompt_scoring_encoder_{image_size}" / "checkpoints" / "checkpoint.pt"
         patterns = [
             f"moma_sam31_image_instance*_{image_size}/checkpoints/checkpoint.pt",
-            "moma_sam31_image_instance*/checkpoints/checkpoint.pt",
         ]
+        fallback_patterns = ["moma_sam31_image_instance*/checkpoints/checkpoint.pt"]
     elif kind == "tracker":
         direct = artifacts / f"moma_sam31_tracklet_len8_head_only_{image_size}" / "checkpoints" / "checkpoint.pt"
         patterns = [
             f"moma_sam31_tracklet*_{image_size}/checkpoints/checkpoint.pt",
-            "moma_sam31_tracklet*/checkpoints/checkpoint.pt",
         ]
+        fallback_patterns = ["moma_sam31_tracklet*/checkpoints/checkpoint.pt"]
     else:
         raise ValueError(f"Unknown checkpoint kind: {kind}")
 
-    candidates = [direct]
+    exact_candidates = [direct]
     for pattern in patterns:
-        candidates.extend(artifacts.glob(pattern))
-    return newest_existing(candidates)
+        exact_candidates.extend(artifacts.glob(pattern))
+    resolved = newest_existing(exact_candidates)
+    if resolved is not None:
+        return resolved
+
+    fallback_candidates: list[Path] = []
+    for pattern in fallback_patterns:
+        fallback_candidates.extend(artifacts.glob(pattern))
+    resolved = newest_existing(fallback_candidates)
+    if resolved is not None:
+        print(
+            f"[SAM31 classify] warning: no {kind} checkpoint found for image_size={image_size}; "
+            f"falling back to {resolved}",
+            flush=True,
+        )
+    return resolved
 
 
 def resolve_checkpoint(value: str | None, output_dir: Path, image_size: int, kind: str) -> Path | None:
     explicit = optional_path(value)
     if explicit is not None:
+        print(f"[SAM31 classify] using explicit {kind} checkpoint: {explicit}", flush=True)
         return explicit
     resolved = latest_checkpoint(classifier_root_from_output_dir(output_dir), image_size, kind)
     if resolved is not None:
@@ -160,6 +176,82 @@ def is_cancel_requested(cancel_path: Path | None) -> bool:
 def check_cancel(cancel_path: Path | None, where: str) -> None:
     if is_cancel_requested(cancel_path):
         raise SystemExit(f"DetecDiv run cancelled during SAM31 classify ({where}).")
+
+
+def output_object_counts(output: dict[str, Any], min_score: float = 0.0) -> tuple[int, int]:
+    obj_ids = output.get("out_obj_ids")
+    if obj_ids is None:
+        return 0, 0
+    if hasattr(obj_ids, "detach"):
+        obj_ids = obj_ids.detach().cpu().numpy()
+    obj_ids_arr = np.asarray(obj_ids).reshape(-1)
+    raw_count = int(obj_ids_arr.size)
+
+    scores = output.get("out_probs")
+    if scores is None:
+        return raw_count, raw_count
+    if hasattr(scores, "detach"):
+        scores = scores.detach().cpu().numpy()
+    scores_arr = np.asarray(scores, dtype=np.float32).reshape(-1)
+    if scores_arr.size != raw_count:
+        return raw_count, raw_count
+    kept_count = int(np.count_nonzero(scores_arr >= float(min_score)))
+    return raw_count, kept_count
+
+
+def stream_propagate_in_video(
+    predictor,
+    session_id: str,
+    *,
+    total_frames: int,
+    min_score: float,
+    cancel_path: Path | None = None,
+    prefix: str = "[SAM31 PY]",
+) -> dict[int, dict]:
+    outputs_per_frame: dict[int, dict] = {}
+    start_time = time.time()
+    last_log = 0.0
+    seen = 0
+    print(f"{prefix} Propagation start ({total_frames} frames)", flush=True)
+    for response in predictor.handle_stream_request(
+        request={
+            "type": "propagate_in_video",
+            "session_id": session_id,
+            "output_prob_thresh": min_score,
+        }
+    ):
+        check_cancel(cancel_path, f"propagate frame {seen + 1}/{total_frames}")
+        frame_idx = int(response["frame_index"])
+        output = response["outputs"]
+        outputs_per_frame[frame_idx] = output
+        seen += 1
+
+        raw_count, kept_count = output_object_counts(output, min_score=min_score)
+        elapsed = max(time.time() - start_time, 1e-6)
+        fps = seen / elapsed
+        remaining = max(total_frames - seen, 0)
+        eta = remaining / fps if fps > 0 else float("nan")
+        now = time.time()
+        should_log = (
+            seen == 1
+            or seen == total_frames
+            or seen % 5 == 0
+            or now - last_log >= 5.0
+        )
+        if should_log:
+            print(
+                f"{prefix} Frame {seen}/{total_frames} done "
+                f"(frame_index={frame_idx + 1}, objects={kept_count}, raw_objects={raw_count}, "
+                f"{fps:.2f} frame/s, ETA {eta:.1f}s)",
+                flush=True,
+            )
+            last_log = now
+    elapsed = max(time.time() - start_time, 1e-6)
+    print(
+        f"{prefix} Propagation done ({seen}/{total_frames} frames, {seen / elapsed:.2f} frame/s)",
+        flush=True,
+    )
+    return outputs_per_frame
 
 
 def robust_u8(image: np.ndarray) -> np.ndarray:
@@ -341,7 +433,7 @@ def run_sam31_text_movie_once(
     fallback_shape: tuple[int, int],
     cancel_path: Path | None = None,
 ):
-    from sam31_ctc_benchmark.sam31_runner import output_to_label_mask, propagate_in_video
+    from sam31_ctc_benchmark.sam31_runner import output_to_label_mask
 
     check_cancel(cancel_path, "before start_session")
     response = predictor.handle_request(request={"type": "start_session", "resource_path": str(image_dir)})
@@ -359,10 +451,18 @@ def run_sam31_text_movie_once(
             }
         )
         check_cancel(cancel_path, "before propagation")
-        outputs = propagate_in_video(predictor, session_id, output_prob_thresh=min_score)
+        outputs = stream_propagate_in_video(
+            predictor,
+            session_id,
+            total_frames=num_frames,
+            min_score=min_score,
+            cancel_path=cancel_path,
+            prefix="[SAM31 PY]",
+        )
         check_cancel(cancel_path, "after propagation")
         labels_by_frame: list[np.ndarray] = []
         stats_by_frame: list[dict] = []
+        final_counts: list[int] = []
         for frame_idx in range(num_frames):
             if frame_idx % 10 == 0:
                 check_cancel(cancel_path, f"label frame {frame_idx + 1}/{num_frames}")
@@ -370,13 +470,23 @@ def run_sam31_text_movie_once(
             if output is None:
                 labels_by_frame.append(np.zeros(fallback_shape, dtype=np.uint16))
                 stats_by_frame.append({"frame_index": frame_idx, "missing_output": True})
+                final_counts.append(0)
                 continue
             labels = output_to_label_mask(output, min_score=min_score)
             labels_by_frame.append(labels)
+            final_count = len([label for label in np.unique(labels) if label != 0])
+            final_counts.append(int(final_count))
             stats = dict(output.get("frame_stats") or {})
             stats["frame_index"] = frame_idx
-            stats["num_output_objects"] = int(labels.max())
+            stats["num_output_objects"] = int(final_count)
             stats_by_frame.append(stats)
+        if final_counts:
+            print(
+                "[SAM31 PY] Final mask objects per frame: "
+                f"min={min(final_counts)}, median={float(np.median(final_counts)):.1f}, "
+                f"max={max(final_counts)}, first={final_counts[0]}, last={final_counts[-1]}",
+                flush=True,
+            )
         return labels_by_frame, stats_by_frame
     finally:
         predictor.handle_request(request={"type": "close_session", "session_id": session_id})
@@ -564,6 +674,287 @@ def get_predictor(
     return PREDICTOR
 
 
+def load_seed_mask(path: Path) -> np.ndarray:
+    mat = loadmat(path)
+    if "seedMask" in mat:
+        mask = np.asarray(mat["seedMask"])
+    elif "seed_mask" in mat:
+        mask = np.asarray(mat["seed_mask"])
+    else:
+        raise ValueError(f"{path} has no seedMask variable")
+    mask = np.squeeze(mask).astype(bool)
+    if mask.ndim != 2:
+        raise ValueError(f"Expected seed mask as [H,W], got {mask.shape}")
+    return mask
+
+
+def prompt_points_from_seed_mask(mask: np.ndarray, margin: int = 4) -> tuple[list[list[float]], list[int]]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise ValueError("Seed mask is empty")
+    height, width = mask.shape
+    cx0 = float(xs.mean())
+    cy0 = float(ys.mean())
+    center_idx = int(np.argmin((xs - cx0) ** 2 + (ys - cy0) ** 2))
+    cx = float(xs[center_idx])
+    cy = float(ys[center_idx])
+    x0 = int(xs.min())
+    x1 = int(xs.max())
+    y0 = int(ys.min())
+    y1 = int(ys.max())
+    candidates = [
+        (cx, max(0, y0 - margin)),
+        (cx, min(height - 1, y1 + margin)),
+        (max(0, x0 - margin), cy),
+        (min(width - 1, x1 + margin), cy),
+        (max(0, x0 - margin), max(0, y0 - margin)),
+        (min(width - 1, x1 + margin), max(0, y0 - margin)),
+        (max(0, x0 - margin), min(height - 1, y1 + margin)),
+        (min(width - 1, x1 + margin), min(height - 1, y1 + margin)),
+    ]
+    points = [[cx, cy]]
+    labels = [1]
+    for nx, ny in candidates:
+        ix = int(round(nx))
+        iy = int(round(ny))
+        if mask[iy, ix]:
+            continue
+        points.append([float(nx), float(ny)])
+        labels.append(0)
+    return points, labels
+
+
+def run_track_correction(cfg: dict[str, Any], output_dir: Path, cancel_path: Path | None) -> None:
+    input_mat_path = as_local_path(cfg["input_mat_path"])
+    seed_mask_path = as_local_path(cfg["seed_mask_mat_path"])
+    if input_mat_path is None or seed_mask_path is None:
+        raise SystemExit("Missing input_mat_path or seed_mask_mat_path")
+
+    raw, frames = load_raw_stack(input_mat_path)
+    seed_mask = load_seed_mask(seed_mask_path)
+    if seed_mask.shape != (raw.shape[0], raw.shape[1]):
+        seed_mask = resize_labels_nearest(seed_mask.astype(np.uint16), (raw.shape[0], raw.shape[1])) > 0
+
+    image_dir = output_dir / "sam31_track_correction_images"
+    write_image_sequence(raw, image_dir, cancel_path=cancel_path)
+    check_cancel(cancel_path, "after correction image export")
+
+    video_kwargs = {
+        "score_threshold_detection": scalar_number(cfg.get("video_score_threshold"), 0.40, "video_score_threshold", minimum=0.0),
+        "new_det_thresh": scalar_number(cfg.get("video_new_det_threshold"), 0.40, "video_new_det_threshold", minimum=0.0),
+        "det_nms_thresh": scalar_number(cfg.get("video_det_nms_threshold"), 0.10, "video_det_nms_threshold", minimum=0.0),
+        "assoc_iou_thresh": scalar_number(cfg.get("video_assoc_iou_threshold"), 0.50, "video_assoc_iou_threshold", minimum=0.0),
+        "hotstart_unmatch_thresh": scalar_number(cfg.get("hotstart_unmatch_thresh"), 3, "hotstart_unmatch_thresh", integer=True, minimum=1.0),
+        "max_num_objects": scalar_number(cfg.get("max_num_objects"), 120, "max_num_objects", integer=True, minimum=1.0),
+    }
+    image_size = scalar_number(cfg.get("image_size"), 560, "image_size", integer=True, minimum=1.0)
+    detector_checkpoint_path = resolve_checkpoint(
+        cfg.get("detector_checkpoint_path"),
+        output_dir=output_dir,
+        image_size=image_size,
+        kind="detector",
+    )
+    tracker_checkpoint_path = resolve_checkpoint(
+        cfg.get("tracker_checkpoint_path"),
+        output_dir=output_dir,
+        image_size=image_size,
+        kind="tracker",
+    )
+    predictor = get_predictor(
+        detector_checkpoint_path=detector_checkpoint_path,
+        tracker_checkpoint_path=tracker_checkpoint_path,
+        image_size=image_size,
+        video_kwargs=video_kwargs,
+    )
+
+    from sam31_ctc_benchmark.sam31_runner import mark_seed_frame_ready, output_to_label_mask
+    import torch
+
+    prompt_margin = scalar_number(cfg.get("prompt_margin"), 4, "prompt_margin", integer=True, minimum=0.0)
+    prompt_obj_id = scalar_number(cfg.get("prompt_obj_id"), 0, "prompt_obj_id", integer=True, minimum=0.0)
+    points, point_labels = prompt_points_from_seed_mask(seed_mask, margin=int(prompt_margin))
+    min_score = scalar_number(cfg.get("min_score"), 0.0, "min_score", minimum=0.0)
+
+    response = predictor.handle_request(request={"type": "start_session", "resource_path": str(image_dir)})
+    session_id = response["session_id"]
+    try:
+        predictor.handle_request(request={"type": "reset_session", "session_id": session_id})
+        check_cancel(cancel_path, "before correction prompt")
+        predictor.handle_request(
+            request={
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": 0,
+                "points": points,
+                "point_labels": point_labels,
+                "obj_id": int(prompt_obj_id),
+                "rel_coordinates": False,
+                "output_prob_thresh": min_score,
+            }
+        )
+        inference_state = predictor._all_inference_states[session_id]["state"]
+        mask_tensor = torch.from_numpy(seed_mask.astype(np.float32)[None]).to(predictor.model.device)
+        obj_ids = [int(prompt_obj_id)]
+        tracker_states = predictor.model._get_sam2_inference_states_by_obj_ids(inference_state, obj_ids)
+        if len(tracker_states) == 1:
+            predictor.model.tracker.add_new_masks(
+                tracker_states[0],
+                frame_idx=0,
+                obj_ids=obj_ids,
+                masks=mask_tensor,
+            )
+        elif len(tracker_states) == len(obj_ids):
+            for tracker_state, obj_id, mask in zip(tracker_states, obj_ids, mask_tensor):
+                predictor.model.tracker.add_new_masks(
+                    tracker_state,
+                    frame_idx=0,
+                    obj_ids=[obj_id],
+                    masks=mask[None],
+                )
+        else:
+            raise RuntimeError(f"Expected one tracker state or one per object, got {len(tracker_states)}")
+        predictor.model.add_action_history(inference_state, "refine", frame_idx=0, obj_ids=obj_ids)
+        mark_seed_frame_ready(predictor, session_id, 0)
+        check_cancel(cancel_path, "before correction propagation")
+        outputs = stream_propagate_in_video(
+            predictor,
+            session_id,
+            total_frames=raw.shape[3],
+            min_score=min_score,
+            cancel_path=cancel_path,
+            prefix="[SAM31 correction PY]",
+        )
+        check_cancel(cancel_path, "after correction propagation")
+    finally:
+        predictor.handle_request(request={"type": "close_session", "session_id": session_id})
+
+    height, width = raw.shape[0], raw.shape[1]
+    candidate_masks = np.zeros((height, width, raw.shape[3]), dtype=np.uint8)
+    stats_by_frame: list[dict[str, Any]] = []
+    for frame_idx in range(raw.shape[3]):
+        output = outputs.get(frame_idx)
+        if output is None:
+            stats_by_frame.append({"frame_index": frame_idx, "missing_output": True})
+            continue
+        labels = output_to_label_mask(output, min_score=min_score)
+        labels = resize_labels_nearest(labels, (height, width))
+        target_label = int(prompt_obj_id) + 1
+        candidate = labels == target_label
+        if not np.any(candidate):
+            candidate = labels > 0
+        candidate_masks[:, :, frame_idx] = candidate.astype(np.uint8)
+        stats = dict(output.get("frame_stats") or {})
+        stats["frame_index"] = frame_idx
+        stats["output_debug"] = output_debug_summary(output)
+        stats["num_candidate_pixels"] = int(candidate_masks[:, :, frame_idx].sum())
+        stats_by_frame.append(stats)
+
+    future_pixels = int(candidate_masks[:, :, 1:].sum()) if raw.shape[3] > 1 else 0
+    if future_pixels == 0 and bool_value(cfg.get("fallback_text_track"), True):
+        fallback_masks, fallback_stats = fallback_text_track_candidates(
+            predictor=predictor,
+            image_dir=image_dir,
+            num_frames=raw.shape[3],
+            seed_mask=seed_mask,
+            min_score=min_score,
+            fallback_shape=(height, width),
+            cancel_path=cancel_path,
+            prompt=str(cfg.get("prompt", "cell")),
+            min_seed_iou=scalar_number(cfg.get("fallback_min_seed_iou"), 0.02, "fallback_min_seed_iou", minimum=0.0),
+        )
+        if fallback_masks is not None and int(fallback_masks[:, :, 1:].sum()) > 0:
+            candidate_masks = fallback_masks
+            stats_by_frame.append(
+                {
+                    "frame_index": -1,
+                    "fallback_text_track": True,
+                    "fallback_stats": fallback_stats,
+                }
+            )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    savemat(
+        output_dir / "track_correction.mat",
+        {
+            "candidate_masks": candidate_masks,
+            "frames_list": frames.reshape(1, -1),
+        },
+        do_compression=True,
+    )
+    (output_dir / "track_correction_stats.json").write_text(
+        json.dumps({"frames": int(raw.shape[3]), "stats_by_frame": stats_by_frame}, indent=2, default=str),
+        encoding="utf-8",
+    )
+
+
+def fallback_text_track_candidates(
+    predictor,
+    image_dir: Path,
+    num_frames: int,
+    seed_mask: np.ndarray,
+    min_score: float,
+    fallback_shape: tuple[int, int],
+    cancel_path: Path | None,
+    prompt: str = "cell",
+    min_seed_iou: float = 0.02,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    labels_by_frame, text_stats = run_sam31_text_movie(
+        predictor=predictor,
+        image_dir=image_dir,
+        num_frames=num_frames,
+        prompt=prompt,
+        min_score=min_score,
+        fallback_shape=fallback_shape,
+        chunk_size=0,
+        chunk_overlap=0,
+        cancel_path=cancel_path,
+    )
+    seed_labels = resize_labels_nearest(labels_by_frame[0], seed_mask.shape)
+    best_label = 0
+    best_iou = 0.0
+    for label in [int(v) for v in np.unique(seed_labels) if v != 0]:
+        mask = seed_labels == label
+        iou = label_iou(mask, seed_mask)
+        if iou > best_iou:
+            best_iou = iou
+            best_label = label
+    stats = {
+        "best_seed_label": int(best_label),
+        "best_seed_iou": float(best_iou),
+        "text_stats_by_frame": text_stats,
+    }
+    if best_label == 0 or best_iou < min_seed_iou:
+        stats["reason"] = "no_text_track_overlaps_seed"
+        return None, stats
+
+    masks = np.zeros((fallback_shape[0], fallback_shape[1], num_frames), dtype=np.uint8)
+    for frame_idx, labels in enumerate(labels_by_frame):
+        labels = resize_labels_nearest(labels, fallback_shape)
+        masks[:, :, frame_idx] = (labels == best_label).astype(np.uint8)
+    stats["candidate_pixels_by_frame"] = masks.sum(axis=(0, 1)).astype(int).tolist()
+    return masks, stats
+
+
+def output_debug_summary(output: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in ("out_obj_ids", "out_probs", "removed_obj_ids", "suppressed_obj_ids", "unconfirmed_obj_ids"):
+        if key in output:
+            summary[key] = np.asarray(output[key]).reshape(-1).tolist()
+    masks = output.get("out_binary_masks")
+    if masks is not None:
+        if hasattr(masks, "detach"):
+            masks = masks.detach().cpu().numpy()
+        masks_arr = np.asarray(masks)
+        if masks_arr.ndim == 4 and masks_arr.shape[1] == 1:
+            masks_arr = masks_arr[:, 0]
+        if masks_arr.ndim == 3:
+            summary["raw_mask_pixels"] = masks_arr.astype(bool).sum(axis=(1, 2)).astype(int).tolist()
+            summary["raw_mask_shape"] = list(masks_arr.shape)
+        else:
+            summary["raw_mask_shape"] = list(masks_arr.shape)
+    return summary
+
+
 def run(config_path: str | Path) -> None:
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
     repo_root = as_local_path(cfg["repo_root"])
@@ -583,6 +974,10 @@ def run(config_path: str | Path) -> None:
     sys.path.insert(0, str(repo_root))
     sys.path.insert(0, str(repo_root / "scripts"))
     sys.path.insert(0, str(sam3_repo))
+
+    if str(cfg.get("task", "classify")) == "track_correction":
+        run_track_correction(cfg, output_dir=output_dir, cancel_path=cancel_path)
+        return
 
     raw, frames = load_raw_stack(input_mat_path)
     image_dir = output_dir / "sam31_images"
@@ -620,6 +1015,7 @@ def run(config_path: str | Path) -> None:
         "new_det_thresh": scalar_number(cfg.get("video_new_det_threshold"), 0.40, "video_new_det_threshold", minimum=0.0),
         "det_nms_thresh": scalar_number(cfg.get("video_det_nms_threshold"), 0.10, "video_det_nms_threshold", minimum=0.0),
         "assoc_iou_thresh": scalar_number(cfg.get("video_assoc_iou_threshold"), 0.50, "video_assoc_iou_threshold", minimum=0.0),
+        "hotstart_unmatch_thresh": scalar_number(cfg.get("hotstart_unmatch_thresh"), 3, "hotstart_unmatch_thresh", integer=True, minimum=1.0),
         "max_num_objects": scalar_number(cfg.get("max_num_objects"), 40, "max_num_objects", integer=True, minimum=1.0),
     }
     video_kwargs = {k: v for k, v in video_kwargs.items() if v is not None}
@@ -642,6 +1038,19 @@ def run(config_path: str | Path) -> None:
         image_size=image_size,
         video_kwargs=video_kwargs,
     )
+    applied_builder_kwargs = dict(getattr(predictor, "sam31_builder_kwargs", {}))
+    applied_video_kwargs = dict(getattr(predictor, "sam31_applied_video_kwargs", {}))
+    ignored_video_kwargs = dict(getattr(predictor, "sam31_ignored_video_kwargs", {}))
+    print(
+        "[SAM31 classify PY] requested tracker params: "
+        f"max_num_objects={video_kwargs['max_num_objects']} "
+        f"hotstart_unmatch_thresh={video_kwargs['hotstart_unmatch_thresh']}; "
+        f"applied hotstart_unmatch_thresh="
+        f"{applied_video_kwargs.get('hotstart_unmatch_thresh', 'model-default')}",
+        flush=True,
+    )
+    chunk_size = scalar_number(cfg.get("chunk_size"), 0, "chunk_size", integer=True, minimum=0.0)
+    chunk_overlap = scalar_number(cfg.get("chunk_overlap"), 0, "chunk_overlap", integer=True, minimum=0.0)
     labels_by_frame, stats_by_frame = run_sam31_text_movie(
         predictor=predictor,
         image_dir=image_dir,
@@ -649,8 +1058,8 @@ def run(config_path: str | Path) -> None:
         prompt=str(cfg.get("prompt", "cell")),
         min_score=scalar_number(cfg.get("min_score"), 0.0, "min_score", minimum=0.0),
         fallback_shape=(raw.shape[0], raw.shape[1]),
-        chunk_size=scalar_number(cfg.get("chunk_size"), 0, "chunk_size", integer=True, minimum=0.0),
-        chunk_overlap=scalar_number(cfg.get("chunk_overlap"), 0, "chunk_overlap", integer=True, minimum=0.0),
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
         cancel_path=cancel_path,
     )
     if not infer_cell_tracking:
@@ -675,7 +1084,20 @@ def run(config_path: str | Path) -> None:
         do_compression=True,
     )
     (output_dir / "sam31_stats.json").write_text(
-        json.dumps({"frames": len(labels_by_frame), "stats_by_frame": stats_by_frame}, indent=2, default=str),
+        json.dumps(
+            {
+                "frames": len(labels_by_frame),
+                "requested_video_kwargs": video_kwargs,
+                "applied_builder_kwargs": applied_builder_kwargs,
+                "applied_video_kwargs": applied_video_kwargs,
+                "ignored_video_kwargs": ignored_video_kwargs,
+                "chunk_size": chunk_size,
+                "chunk_overlap": chunk_overlap,
+                "stats_by_frame": stats_by_frame,
+            },
+            indent=2,
+            default=str,
+        ),
         encoding="utf-8",
     )
 

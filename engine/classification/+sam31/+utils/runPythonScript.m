@@ -101,10 +101,24 @@ end
 end
 
 function key = wslServerKey(runtime, scriptPath)
+serverScript = fullfile(fileparts(scriptPath), 'sam31_wsl_server.py');
 key = strjoin({ ...
     char(string(runtime.repoRoot)), ...
     char(string(runtime.sam3Repo)), ...
-    char(string(fileparts(scriptPath)))}, '|');
+    char(string(fileparts(scriptPath))), ...
+    fileStamp(scriptPath), ...
+    fileStamp(serverScript)}, '|');
+end
+
+function stamp = fileStamp(pathValue)
+stamp = 'missing';
+try
+    info = dir(pathValue);
+    if ~isempty(info)
+        stamp = sprintf('%.12g', info.datenum);
+    end
+catch
+end
 end
 
 function [readyFile, logFile, host, port] = startWslServer(runtime, scriptPath)
@@ -594,12 +608,12 @@ pythonPath = strjoin({fileparts(scriptWsl), repoRoot, [repoRoot '/scripts'], sam
 end
 
 function prelude = wslMountPrelude()
-prelude = ['sudo mkdir -p /mnt/x && ' ...
-    'if ! mountpoint -q /mnt/x; then sudo mount -t drvfs ''//10.20.11.250/Data'' /mnt/x; fi && '];
+prelude = ['(sudo mkdir -p /mnt/x >/dev/null 2>&1 || true); ' ...
+    'if ! mountpoint -q /mnt/x; then sudo mount -t drvfs ''//10.20.11.250/Data'' /mnt/x >/dev/null 2>&1 || true; fi; '];
 end
 
 function line = wslMountPreludeLine()
-line = 'sudo mkdir -p /mnt/x && if ! mountpoint -q /mnt/x; then sudo mount -t drvfs ''//10.20.11.250/Data'' /mnt/x; fi';
+line = '(sudo mkdir -p /mnt/x >/dev/null 2>&1 || true); if ! mountpoint -q /mnt/x; then sudo mount -t drvfs ''//10.20.11.250/Data'' /mnt/x >/dev/null 2>&1 || true; fi';
 end
 
 function writeWslLaunchScript(pathValue, lines)

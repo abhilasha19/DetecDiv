@@ -2133,6 +2133,18 @@ end
             % gather the test set.
 
             selectedfortest=find(cellfun(@(x) x==0,app.UITableData.Data(:,1)));
+            try
+                if strcmpi(char(string(classiObj.classifierPkg)), 'sam31') || ...
+                        strcmpi(char(string(classiObj.classifyFun)), 'sam31.classify')
+                    sam31.displayValidationRuns(classiObj, selectedfortest');
+                    return;
+                end
+            catch ME
+                uialert(app.ClassifierUIFigure, ...
+                    sprintf('Could not open SAM31 validation browser:\n%s', ME.message), ...
+                    'SAM31 validation runs', 'Icon', 'error');
+                return;
+            end
             classiObj.stats('Confusion','Classes','Rois',selectedfortest','Force');
         end
 
@@ -2274,10 +2286,10 @@ end
     end
 
     % Prompt
-    prompt = {'Frames to be processed (0 = all)'};
+    prompt = {'Frames to export: all / 0 / 1:10:200 / 1,5,8,20'};
     dlgtitle = 'Input formatting parameters';
     dims = [1 100];
-    definput = {'0'};
+    definput = {'all'};
     answer = inputdlg(prompt, dlgtitle, dims, definput);
 
     if isempty(answer)
@@ -2285,9 +2297,10 @@ end
     end
 
     % Parse
-    framesToProcess = str2double(answer{1});
-    if isnan(framesToProcess) || framesToProcess < 0
-        uialert(app.ClassifierUIFigure,'Frames must be 0 or a positive number.','Error');
+    try
+        framesToProcess = parseTrainingFrameSelection(app, answer{1});
+    catch ME
+        uialert(app.ClassifierUIFigure, ME.message, 'Invalid frame selection');
         return;
     end
 
@@ -2309,6 +2322,30 @@ end
         nExport = output;
     elseif isstruct(output) && isfield(output,'metrics') && isfield(output.metrics,'outputCount')
         nExport = output.metrics.outputCount;
+    elseif isstruct(output) && isfield(output,'metrics') && isfield(output.metrics,'framebankFrames')
+        nExport = output.metrics.framebankFrames;
+    end
+    formatNotes = {};
+    if isstruct(output) && isfield(output, 'metrics')
+        if isfield(output.metrics, 'skippedEmptyMaskFrames') && output.metrics.skippedEmptyMaskFrames > 0
+            formatNotes{end+1} = sprintf('%d frame(s) without GT masks were not exported.', ...
+                output.metrics.skippedEmptyMaskFrames); %#ok<AGROW>
+            if isfield(output.metrics, 'skippedEmptyMaskDetails') && ~isempty(output.metrics.skippedEmptyMaskDetails)
+                details = output.metrics.skippedEmptyMaskDetails;
+                if ischar(details) || isstring(details)
+                    details = cellstr(string(details));
+                end
+                maxDetails = min(numel(details), 12);
+                for ii = 1:maxDetails
+                    formatNotes{end+1} = [' - ' char(string(details{ii}))]; %#ok<AGROW>
+                end
+                if numel(details) > maxDetails
+                    formatNotes{end+1} = sprintf(' - ... %d more item(s)', numel(details) - maxDetails); %#ok<AGROW>
+                end
+            end
+        elseif isfield(output.metrics, 'skippedFrames') && output.metrics.skippedFrames > 0
+            formatNotes{end+1} = sprintf('%d frame(s) were not exported.', output.metrics.skippedFrames); %#ok<AGROW>
+        end
     end
 
     if nExport > 0
@@ -2319,6 +2356,9 @@ end
         strr = d.Message;
         pause(1);
     end
+    if ~isempty(formatNotes)
+        strr = sprintf('%s\n\n%s', strr, strjoin(formatNotes, newline));
+    end
 
     close(d);
     displayProperties(app);
@@ -2327,6 +2367,26 @@ end
 
 
 
+        end
+
+        function frames = parseTrainingFrameSelection(app, txt) %#ok<INUSD>
+            txt = strtrim(char(string(txt)));
+            if isempty(txt) || any(strcmpi(txt, {'all','0','-1'}))
+                frames = [];
+                return;
+            end
+
+            txt = strrep(txt, ',', ' ');
+            frames = str2num(txt); %#ok<ST2NM>
+            if isempty(frames) || ~isnumeric(frames)
+                error('Enter frames as all, 0, 1:200, 1:10:200, or 1,5,8,20.');
+            end
+
+            frames = unique(round(double(frames(:).')), 'stable');
+            frames = frames(isfinite(frames));
+            if isempty(frames) || any(frames < 1)
+                error('Frame numbers must be positive integers, or use all/0.');
+            end
         end
 
         % Menu selected function: TrainClassifierMenu

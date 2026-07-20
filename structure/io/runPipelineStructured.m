@@ -1033,7 +1033,12 @@ function ctx = executeNode(node, ctx)
     switch nodeType
         case 'dataloader'
             try
-                ctx = dataLoader.process(ctx);
+                fun = resolveNodeFunc(node);
+                if strcmpi(char(string(fun)), 'dataLoader.process')
+                    ctx = dataLoader.process(ctx);
+                else
+                    ctx = feval(fun, ctx);
+                end
                 ctx = markDataloaderFovSelectionApplied(ctx);
             catch ME
                 throwNodeFailed(node, ME);
@@ -1740,6 +1745,11 @@ function ctx = executeProcessorNode(node, ctx)
     procCtx.run = getfielddefault(ctx, 'run', struct());
     procCtx.sel = getfielddefault(ctx, 'sel', struct());
     procCtx.pipeline = getfielddefault(ctx, 'pipeline', struct());
+    procCtx.shallow = getfielddefault(ctx, 'shallow', []);
+    procCtx.shallowObj = getfielddefault(ctx, 'shallowObj', procCtx.shallow);
+    procCtx.fovList = getfielddefault(ctx, 'fovList', []);
+    procCtx.roiList = rois;
+    procCtx.annotations = getfielddefault(ctx, 'annotations', struct());
     procCtx.io = getfielddefault(ctx, 'io', struct());
     procCtx.io.requiredChannels = mergeChannelLists( ...
         getfielddefault(procCtx.io, 'requiredChannels', {}), ...
