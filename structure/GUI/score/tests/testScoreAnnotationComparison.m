@@ -87,7 +87,7 @@ for overlay = [false true]
     verifyEqual(testCase,double(gh.imgHandles.Count),6*(1+~overlay));
     movie = VideoReader(opts.name);
     verifyGreaterThan(testCase,movie.Duration,0);
-    verifyGreaterThan(testCase,movie.Height,0);
+    verifyEqual(testCase,[double(movie.Width) double(movie.Height)],gh.movieLayout.canvasSize);
     clear movie;
     % The writer has already advanced every ROI to the second frame.
     for p = gh.comparisonPanels
